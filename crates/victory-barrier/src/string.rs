@@ -101,11 +101,11 @@ fn pieces(from: u64, to: u64) -> impl Iterator<Item = (u64, u64)> {
     })
 }
 
-/// Marks where the bytes of `[from, to)` went, after they were written: a
-/// mark per block, at our address of it.
+/// Marks where the bytes of `[from, to)` went, after they were written: each
+/// part, at our address of it.
 fn mark(tables: &Tables, from: u64, to: u64) {
-    for (at, _) in pieces(from, to) {
-        tables.mark(tables.resolve(at));
+    for (at, end) in pieces(from, to) {
+        tables.mark_range(tables.resolve(at), end - at);
     }
 }
 

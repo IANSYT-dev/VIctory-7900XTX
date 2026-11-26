@@ -218,8 +218,8 @@ fn stores_go_beside_the_guard_and_are_marked() {
         }
         assert_eq!(
             marked,
-            vec![ours + BLOCK, ours + 2 * BLOCK, ours + 3 * BLOCK],
-            "round {round}: marks at our view's blocks"
+            vec![(ours + BLOCK, 1), (ours + 2 * BLOCK, 1), (ours + 3 * BLOCK, 1)],
+            "round {round}: marks at our view's blocks, each in its first 4 KiB"
         );
     }
     assert_eq!(REFUSED.load(Ordering::SeqCst), 0);

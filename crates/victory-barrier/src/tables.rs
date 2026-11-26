@@ -4,7 +4,7 @@
 //! shared junk marks, so a barrier can index any address. A slot gets its
 //! own deltas when a block in it is given one ([`set_delta`]), and its own
 //! marks when one of our views lies in it ([`track`]). Nothing is ever
-//! given back: a slot's deltas are 8 MiB of address space, its marks 1 MiB,
+//! given back: a slot's deltas are 8 MiB of address space, its marks 17 MiB,
 //! and only the pages written come to be.
 //!
 //! [`take`] finds and clears the marks. Who asks whether memory was written
@@ -14,7 +14,7 @@
 //! at whether a taking is under way.
 
 use crate::layout::{
-    BLOCK_SHIFT, BLOCK_SHR, BLOCKS_PER_SLOT, COARSE_SHIFT, COARSES_PER_SLOT, MID_SHIFT, MIDS_PER_SLOT,
+    BLOCK_SHIFT, BLOCK_SHR, BLOCKS_PER_SLOT, PARTS_PER_BLOCK, PARTS_PER_SLOT, COARSE_SHIFT, COARSES_PER_SLOT, MID_SHIFT, MIDS_PER_SLOT,
     SLOT_SHIFT, SLOTS, Tables, index, slot,
 };
 use std::sync::Mutex;
@@ -22,13 +22,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 static DELTA: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+static PART: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static FINE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static MID: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static COARSE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// Slots with marks of their own, a bit each.
 static TRACKED: [AtomicU64; SLOTS / 64] = [const { AtomicU64::new(0) }; SLOTS / 64];
-/// The shared arrays: (zero deltas, junk fine, junk mid, junk coarse).
-static SHARED: OnceLock<[u64; 4]> = OnceLock::new();
+/// The shared arrays: (zero deltas, junk part, fine, mid and coarse marks).
+static SHARED: OnceLock<[u64; 5]> = OnceLock::new();
 /// Serialises making a slot's arrays, and taking marks.
 static MAKING: Mutex<()> = Mutex::new(());
 static TAKING: Mutex<()> = Mutex::new(());
@@ -66,15 +67,17 @@ pub fn tables() -> Option<Tables> {
                 None => {
                     let s = [
                         alloc(BLOCKS_PER_SLOT * 8, true)?,
+                        alloc(PARTS_PER_SLOT, false)?,
                         alloc(BLOCKS_PER_SLOT, false)?,
                         alloc(MIDS_PER_SLOT, false)?,
                         alloc(COARSES_PER_SLOT.max(64), false)?,
                     ];
                     for k in 0..SLOTS {
                         DELTA[k].store(s[0], Ordering::Release);
-                        FINE[k].store(s[1], Ordering::Release);
-                        MID[k].store(s[2], Ordering::Release);
-                        COARSE[k].store(s[3], Ordering::Release);
+                        PART[k].store(s[1], Ordering::Release);
+                        FINE[k].store(s[2], Ordering::Release);
+                        MID[k].store(s[3], Ordering::Release);
+                        COARSE[k].store(s[4], Ordering::Release);
                     }
                     let _ = SHARED.set(s);
                     s
@@ -85,6 +88,7 @@ pub fn tables() -> Option<Tables> {
     let _ = shared;
     Some(Tables {
         delta: DELTA.as_ptr().cast(),
+        part: PART.as_ptr().cast(),
         fine: FINE.as_ptr().cast(),
         mid: MID.as_ptr().cast(),
         coarse: COARSE.as_ptr().cast(),
@@ -170,10 +174,11 @@ pub fn track(from: u64, len: u64) -> bool {
     let (first, last) = (from >> SLOT_SHIFT, (from + len.max(1) - 1) >> SLOT_SHIFT);
     for s in first..=last {
         let s = s as usize & (SLOTS - 1);
-        if FINE[s].load(Ordering::Acquire) != shared[1] {
+        if FINE[s].load(Ordering::Acquire) != shared[2] {
             continue;
         }
-        let (Some(fine), Some(mid), Some(coarse)) = (
+        let (Some(part), Some(fine), Some(mid), Some(coarse)) = (
+            alloc(PARTS_PER_SLOT, false),
             alloc(BLOCKS_PER_SLOT, false),
             alloc(MIDS_PER_SLOT, false),
             alloc(COARSES_PER_SLOT.max(64), false),
@@ -182,6 +187,7 @@ pub fn track(from: u64, len: u64) -> bool {
         };
         // The finest first: a barrier that sees the slot's coarse array
         // marks the others of the same slot.
+        PART[s].store(part, Ordering::Release);
         FINE[s].store(fine, Ordering::Release);
         MID[s].store(mid, Ordering::Release);
         COARSE[s].store(coarse, Ordering::Release);
@@ -218,10 +224,11 @@ fn any() -> bool {
 }
 
 /// Takes every mark: `wrote` is told the addresses of the 64 KiB blocks of
-/// our views that stores went to since (if any), and returns before any
-/// other taking can answer that nothing was written. Who reads a block's
-/// bytes after this returns finds every store whose mark was taken.
-pub fn take(wrote: impl FnOnce(&[u64])) {
+/// our views that stores went to since (if any), each with its parts written
+/// (a bit per 4 KiB), and returns before any other taking can answer that
+/// nothing was written. Who reads those parts' bytes after this returns finds
+/// every store whose mark was taken.
+pub fn take(wrote: impl FnOnce(&[(u64, u16)])) {
     if !any() {
         return;
     }
@@ -230,7 +237,8 @@ pub fn take(wrote: impl FnOnce(&[u64])) {
     let mut blocks = Vec::new();
     for s in tracked() {
         let slot_base = (s as u64) << SLOT_SHIFT;
-        let (fine, mid, coarse) = (
+        let (part, fine, mid, coarse) = (
+            PART[s].load(Ordering::Acquire),
             FINE[s].load(Ordering::Acquire),
             MID[s].load(Ordering::Acquire),
             COARSE[s].load(Ordering::Acquire),
@@ -248,8 +256,16 @@ pub fn take(wrote: impl FnOnce(&[u64])) {
                 let fines_per = 1 << (MID_SHIFT - BLOCK_SHIFT);
                 for f in m * fines_per..(m + 1) * fines_per {
                     let fb = &bytes(fine, BLOCKS_PER_SLOT)[f];
-                    if fb.load(Ordering::SeqCst) != 0 && fb.swap(0, Ordering::SeqCst) != 0 {
-                        blocks.push(slot_base + ((f as u64) << BLOCK_SHIFT));
+                    if fb.load(Ordering::SeqCst) == 0 || fb.swap(0, Ordering::SeqCst) == 0 {
+                        continue;
+                    }
+                    let parts = &bytes(part, PARTS_PER_SLOT)[f * PARTS_PER_BLOCK..(f + 1) * PARTS_PER_BLOCK];
+                    let mask = parts.iter().enumerate().fold(0u16, |m, (k, pb)| {
+                        if pb.load(Ordering::SeqCst) != 0 && pb.swap(0, Ordering::SeqCst) != 0 { m | 1 << k } else { m }
+                    });
+                    // (None: an earlier taking took them, and the bytes.)
+                    if mask != 0 {
+                        blocks.push((slot_base + ((f as u64) << BLOCK_SHIFT), mask));
                     }
                 }
             }
@@ -274,9 +290,14 @@ mod tests {
         t.mark(view + 5);
         t.mark(view + (3 << 16) + 100);
         t.mark(view + (3 << 16) + 200);
+        t.mark_range(view + (3 << 16) + (5 << 12) - 1, 2);
+        t.mark_range(view + (5 << 16) + (2 << 12), 3 << 12);
         let mut got = Vec::new();
         take(|b| got.extend_from_slice(b));
-        assert_eq!(got, vec![view, view + (3 << 16)]);
+        assert_eq!(
+            got,
+            vec![(view, 1), (view + (3 << 16), 0b11_0001), (view + (5 << 16), 0b1_1100)]
+        );
         let mut again = Vec::new();
         take(|b| again.extend_from_slice(b));
         assert!(again.is_empty());

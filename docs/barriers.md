@@ -57,12 +57,18 @@ block.
   branch, no flag changed): a block's delta is our view's address minus the
   title's, set at the block's first write fault, 0 elsewhere. A store with
   delta 0 goes where the title meant and faults as before.
-- **Marks.** A byte per 64 KiB block, per 4 MiB and per GiB, at our view's
-  address (one per page, whichever address the title wrote through). Taking
-  them when there are none reads 64 bytes per 64 GiB slot holding our views.
-  The order (store, fine, middle, coarse mark; taken coarse first, under a
-  lock that "nothing written" waits for) means a mark missed by one taking is
-  found by the next.
+- **Marks.** A byte per 4 KiB part, per 64 KiB block, per 4 MiB and per
+  GiB, at our view's address (one per page, whichever address the title
+  wrote through). Taking them when there are none reads 64 bytes per 64 GiB
+  slot holding our views. The order (store, part, block, 4 MiB, GiB mark;
+  taken coarsest first, under a lock that "nothing written" waits for) means
+  a mark missed by one taking is found by the next.
+- **Parts.** A block that stayed guarded and was written only beside its
+  guard by barriers (or the copies below) is told with the 4 KiB parts they
+  marked, not whole (`watch::guard_parts`), so the journal holds those parts
+  and a refresh copies them, as it already does for the parts the kernel's
+  write watch names. A block `put_beside` wrote is told whole
+  (`BESIDE_WHOLE`), as is one a fault opened.
 - **Other patches.** A function with a jump out of the image (VIctory's
   `write_sites`, `descriptor_sites` stubs) is never moved, and what follows
   such a jump counts as a branch target.
@@ -84,23 +90,34 @@ copies 256 bytes into each of 64 guarded blocks of a section shown twice, a
 frame at a time, then asks about both views (Ryzen 5 7600, Windows 10; one
 run, the copies' time summed over the threads):
 
-| copies a block, threads | plain (fault, open, guard again) | `put_beside` | barriers' delta | askings: plain / `put_beside` / barriers |
-|---|---:|---:|---:|---|
-| 1, 1 | 2.95 us a copy | 0.124 us | 0.088 us | 50 / 4 / 9 us a frame |
-| 64, 1 | 0.086 us | 0.079 us | 0.045 us | 56 / 56 / 7 us |
-| 1, 8 | 7.65 us | 0.270 us | 0.166 us | 51 / 4 / 7 us |
-| 64, 8 | 0.171 us | 0.178 us | 0.100 us | 51 / 52 / 7 us |
+| copies a block, threads | plain (fault, open, guard again) | `put_beside` | barriers' delta |
+|---|---:|---:|---:|
+| 1, 1 | 2.68 us a copy | 0.112 us | 0.098 us |
+| 64, 1 | 0.080 us | 0.081 us | 0.049 us |
+| 1, 8 | 6.40 us | 0.254 us | 0.187 us |
+| 64, 8 | 0.163 us | 0.195 us | 0.166 us |
+
+Then a host copy of each view is refreshed as a submission does
+(`Tracked::take`): what it takes, and the time of both takes:
+
+| copies a block | plain | `put_beside` | barriers |
+|---|---:|---:|---:|
+| 1 (256 bytes) | 8192 KiB, 54-59 us | 8192 KiB, 10-13 us | **512 KiB**, 24-27 us |
+| 64 (16 KiB) | 8192 KiB, 62-63 us | 8192 KiB, 60-64 us | **2560 KiB**, 27 us |
 
 - Against a fault, a copy beside the guard is 20-50 times cheaper, either
   way, and the block keeps its guard, so the asking guards nothing again.
+- What a refresh copies (and sends up, and the card hashes again) is the
+  parts written: here 16 times less for small copies, 3 times less for 16
+  KiB ones. The askings cost more than `put_beside`'s (the journal keeps
+  parts; ~14 us for 128 blocks here), which the bytes not copied pay for
+  many times over.
 - Against `put_beside`, the delta is somewhat cheaper per copy, and the
   difference grows with threads (no locks). With more than 32 copies a block
   between askings, `put_beside` opens the block (its share), and the copies
   and the asking cost what the plain way does; the delta has no share.
-- With one copy a block, the asking costs ~5 us more (64 blocks): the marks
-  are turned into bits at every view there, on the thread that asks, where
-  `put_beside` does it on the title's thread at the copy. About 60 ns a
-  block written, on the thread that prepares submissions.
+- The marks are turned into bits at every view on the thread that asks,
+  where `put_beside` does it on the title's thread at the copy.
 
 ## Switches
 
@@ -127,7 +144,20 @@ seen and blocks given a delta.
 
 ## Not done
 
-- Memory the kernel's write watch tracks: no fault names its stores.
+- Memory the kernel's write watch tracks (`XMemVirtualAlloc`'s private
+  memory): no fault names its stores, and private memory cannot be mapped a
+  second time, so a barrier has nowhere to store beside a guard. Made of
+  sections the way `xmem` makes physical pages, it would be view memory, and
+  the guards, our views, `kernel_writing` and barriers would take it as they
+  are; only what copies take is guarded, so memory the card never reads does
+  not fault. That would replace its askings (5.4 ms a frame on the
+  submitting thread, 4.4 of it in the kernel). Open: a barrier costs every
+  patched store into it some 25 instructions, where the write watch costs
+  nothing (some 29 MB a frame are written there); a view cannot be
+  decommitted (whether the title decommits is not known); Wine keeps the
+  write watch; `VICTORY_INPLACE`'s private-memory heaps (off by default)
+  would not open. A few days' work behind a switch of its own, worth doing
+  once a run says what those cost.
 - The title's own `VirtualProtect` of view memory: a block the title makes
   read-only keeps its delta, so a store it expects to fault goes beside.
 - Title DLLs loaded after the start are not patched.

@@ -659,14 +659,14 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
 }
 
 /// The title's addresses of the 64 KiB pages our own views ([`beside`])
-/// hold at `ours` (each a page's address): every view of each page, for the
-/// barriers' marks (`crate::barrier::take`). A page no view shows any more is
-/// left out.
-pub(crate) fn views_of_beside(ours: &[u64]) -> Vec<usize> {
+/// hold at `ours` (each a page's address, with what goes with it): every
+/// view of each page, for the barriers' marks (`crate::barrier::take`). A
+/// page no view shows any more is left out.
+pub(crate) fn views_of_beside<T: Copy>(ours: &[(u64, T)]) -> Vec<(usize, T)> {
     let v = views();
     let wholes = &v.whole_by_address;
     let mut shown = Vec::new();
-    for &at in ours {
+    for &(at, with) in ours {
         let at = at as usize;
         let Some(&(base, end, section)) = wholes.partition_point(|w| w.0 <= at).checked_sub(1).map(|i| &wholes[i]) else {
             continue;
@@ -674,7 +674,7 @@ pub(crate) fn views_of_beside(ours: &[u64]) -> Vec<usize> {
         if at < end
             && let Some(all) = v.pages.get(&(section, (at - base) as u64))
         {
-            shown.extend_from_slice(all);
+            shown.extend(all.iter().map(|&view| (view, with)));
         }
     }
     shown

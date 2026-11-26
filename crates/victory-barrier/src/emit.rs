@@ -14,7 +14,7 @@
 //! barrier should too.
 
 use crate::classify::{Address, Inline, Refusal, Store};
-use crate::layout::{BLOCK_SHR, COARSE_SHR, INDEX_SHL, MID_SHR, SLOT_SHIFT, Tables};
+use crate::layout::{BLOCK_SHR, COARSE_SHR, INDEX_SHL, MID_SHR, PART_SHR, SLOT_SHIFT, Tables};
 use crate::string::{self, StringSite};
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, FlowControl, Instruction, InstructionBlock,
@@ -260,7 +260,7 @@ fn inline_store(
         MemoryOperand::with_base_index(a, b),
     ))?);
     // Mark the first and last byte in `table`'s map at `shr`: a store of up
-    // to 64 KiB covers at most two units of each level. `a` is left at the
+    // to 4 KiB covers at most two units of each level. `a` is left at the
     // first byte.
     let mark = |list: &mut Vec<Instruction>, table: *const u64, shr: u32| -> Result<(), Refusal> {
         slot(list, c, a, d)?;
@@ -302,6 +302,7 @@ fn inline_store(
         Ok(())
     };
     // The finest first: who takes them takes the coarsest first.
+    mark(list, tables.part, PART_SHR)?;
     mark(list, tables.fine, BLOCK_SHR)?;
     mark(list, tables.mid, MID_SHR)?;
     mark(list, tables.coarse, COARSE_SHR)?;

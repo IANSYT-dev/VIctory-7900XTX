@@ -878,7 +878,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let written = guard_parts(first * PAGE, last * PAGE);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1227,6 +1227,9 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     put(page.wrapping_sub(block * BLOCK));
     count.fetch_add(weight, Relaxed);
     for view in shown.iter().filter(|&&view| view != 0) {
+        BESIDE_WHOLE.set(view / BLOCK);
+    }
+    for view in shown.iter().filter(|&&view| view != 0) {
         BESIDE.set(view / BLOCK);
     }
     for view in shown.iter().filter(|&&view| view != 0) {
@@ -1241,11 +1244,29 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
 /// those bits; returns only once every mark taken is told.
 fn barrier_marks() {
     crate::barrier::take(|views| {
-        let mut blocks: Vec<usize> = views.iter().map(|&view| view / BLOCK).collect();
+        {
+            // The parts first: who finds the bit finds them.
+            let mut parts = BESIDE_PARTS.lock().unwrap_or_else(|e| e.into_inner());
+            for &(view, written) in views {
+                *parts.entry(view / BLOCK).or_default() |= written;
+            }
+        }
+        let mut blocks: Vec<usize> = views.iter().map(|&(view, _)| view / BLOCK).collect();
         BESIDE.set_all(&mut blocks, false);
         PUBLISHED.set_all(&mut blocks, true);
     });
 }
+
+/// Of blocks whose bit [`BESIDE`] holds: the 4 KiB parts barriers wrote
+/// ([`barrier_marks`]), so that an asking that finds a block written only so
+/// tells those parts, and a refresh copies them, not the block.
+static BESIDE_PARTS: std::sync::Mutex<std::collections::BTreeMap<usize, u16>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Of blocks whose bit [`BESIDE`] holds: written by [`put_beside`], whose
+/// parts are not known (the whole block is told). Set after the bytes are in
+/// and before [`BESIDE`]'s bit.
+static BESIDE_WHOLE: Bits = Bits::new();
 
 /// A faulting store of the title's leaves `block` as it is: whether it may be
 /// left out (until that has been so often, since the block was taken, that
@@ -1856,7 +1877,15 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_parts(start, end).map(|written| written.into_iter().map(|(block, _)| block).collect())
+}
+
+/// [`guard`], with the parts of each block written: all of them ([`WHOLE`])
+/// but for a block that stayed guarded and clean and was written only beside
+/// its guard by barriers, whose parts they marked.
+fn guard_parts(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     barrier_marks();
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
@@ -1922,8 +1951,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    let mut parts = vec![WHOLE; written.len()];
     let mut run: Option<(usize, usize)> = None;
-    for &block in &written {
+    for (i, &block) in written.iter().enumerate() {
         if let Some((from, to)) = run
             && to != block
         {
@@ -1935,9 +1965,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             g = guards_timed();
         }
         // Told as written by this, and read by the caller after.
-        if BESIDE.take(block) {
+        let beside = BESIDE.take(block);
+        if beside {
             put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         }
+        // In this order (the bit, then the whole block's, then the parts):
+        // what is put beside after the bit was taken is told next time.
+        let whole = beside && BESIDE_WHOLE.take(block);
+        let marked = if beside { BESIDE_PARTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&block) } else { None };
         if g.protected.contains(block) {
             // Read-only by way of another view of its page, or not clean
             // because one could not be made so. (Or clean, and bytes were put
@@ -1946,6 +1981,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 protect(&mut g, from, to);
             }
             if g.clean.contains(block) {
+                // Written beside the guard alone: by barriers, the parts they
+                // marked.
+                if let Some(marked) = marked.filter(|&m| !whole && m != 0) {
+                    parts[i] = marked;
+                }
                 continue;
             }
             if cover(&mut g, block, block + 1) {
@@ -1963,7 +2003,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     drop(g);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
-    Some(written)
+    Some(written.into_iter().zip(parts).collect())
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -4011,7 +4051,6 @@ mod tests {
         const PIECE: usize = 256;
         const FRAMES: usize = 100;
         let wrapped = crate::titlewrite::copy_for_test(real as *const () as usize);
-        let all = |view: usize| (0..BLOCKS).map(|b| view / BLOCK + b).collect::<Vec<_>>();
         let value = |frame: usize, b: usize| ((frame * 7 + b) as u8) | 1;
         let mut lines = Vec::new();
         for (pieces, threads) in [(1usize, 1usize), (64, 1), (1, 8), (64, 8)] {
@@ -4022,7 +4061,13 @@ mod tests {
                     let _ = guard(view, view + SIZE);
                     let _ = guard(view, view + SIZE);
                 }
-                let (mut copying, mut asking) = (Duration::ZERO, Duration::ZERO);
+                // A host copy of each view, refreshed as a submission does:
+                // what its takes name is what it copies.
+                let copies = [track(one, SIZE, true).expect("a view"), track(two, SIZE, true).expect("a view")];
+                for (copy, view) in copies.iter().zip([one, two]) {
+                    let _ = copy.take(view, view + SIZE);
+                }
+                let (mut copying, mut asking, mut taken) = (Duration::ZERO, Duration::ZERO, 0usize);
                 for frame in 0..FRAMES {
                     // Each thread's own time, from its first copy to its last.
                     let spent: Vec<Duration> = std::thread::scope(|s| {
@@ -4055,10 +4100,18 @@ mod tests {
                     });
                     copying += spent.iter().sum::<Duration>();
                     let began = Instant::now();
-                    let (told_one, told_two) = (guard(one, one + SIZE), guard(two, two + SIZE));
+                    let takes = [copies[0].take(one, one + SIZE), copies[1].take(two, two + SIZE)];
                     asking += began.elapsed();
-                    assert_eq!(told_one, Some(all(one)), "{way}, frame {frame}: told at the first view");
-                    assert_eq!(told_two, Some(all(two)), "{way}, frame {frame}: told at the second");
+                    for (ranges, view) in takes.iter().zip([one, two]) {
+                        taken += ranges.iter().map(|(a, b)| b - a).sum::<usize>();
+                        for b in 0..BLOCKS {
+                            let (from, to) = (view + b * BLOCK + 256, view + b * BLOCK + 256 + pieces * PIECE);
+                            assert!(
+                                ranges.iter().any(|&(a, e)| a <= from && to <= e),
+                                "{way}, frame {frame}: block {b} of {view:#x} taken: {ranges:x?}"
+                            );
+                        }
+                    }
                     for b in [0, BLOCKS / 2, BLOCKS - 1] {
                         // SAFETY: inside the second view.
                         let there = unsafe { std::slice::from_raw_parts((two + b * BLOCK + 256) as *const u8, pieces * PIECE) };
@@ -4067,10 +4120,11 @@ mod tests {
                 }
                 let us = |d: Duration| d.as_secs_f64() * 1e6 / FRAMES as f64;
                 lines.push(format!(
-                    "{pieces:>2} a block, {threads} thread(s), {way:>10}: copies {:8.1} us of threads' time a frame ({:.3} us a copy), askings {:6.1} us",
+                    "{pieces:>2} a block, {threads} thread(s), {way:>10}: copies {:8.1} us of threads' time a frame ({:.3} us a copy), askings {:6.1} us, a refresh takes {:5} KiB a frame",
                     us(copying),
                     us(copying) / (BLOCKS * pieces) as f64,
-                    us(asking)
+                    us(asking),
+                    taken / FRAMES / 1024
                 ));
                 drop_views(section, &[one, two], SIZE);
                 crate::title_memory_section_gone(section);

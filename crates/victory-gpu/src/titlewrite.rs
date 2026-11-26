@@ -231,7 +231,7 @@ fn in_pieces(to: usize, n: usize, same: impl Fn(usize, usize, usize) -> bool, pu
             // the mark, as a barrier stores and marks.
             if let Some(delta) = crate::barrier::beside(at) {
                 put(at.wrapping_add(delta), offset, len);
-                crate::barrier::wrote(at.wrapping_add(delta));
+                crate::barrier::wrote(at.wrapping_add(delta), len);
                 offset += len;
                 continue;
             }

@@ -199,11 +199,11 @@ pub(crate) fn beside(at: usize) -> Option<usize> {
     give_delta(at)
 }
 
-/// A piece of a copy was written at `ours` (our view, inside one block):
-/// marked as a barrier marks.
-pub(crate) fn wrote(ours: usize) {
+/// A piece of a copy was written at `[ours, ours + len)` (our view, inside
+/// one block): its parts marked as a barrier marks.
+pub(crate) fn wrote(ours: usize, len: usize) {
     if let Some(t) = tables::tables() {
-        t.mark(ours as u64);
+        t.mark_range(ours as u64, len as u64);
         COPIED.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -217,9 +217,10 @@ pub(crate) fn forget(at: usize, len: usize) {
 }
 
 /// Takes the barriers' marks: `wrote` is given the title's addresses of the
-/// blocks written (every view of each page written), before any other taking
-/// can answer that nothing was.
-pub(crate) fn take(wrote: impl FnOnce(&[usize])) {
+/// blocks written (every view of each page written), each with the parts
+/// written (a bit per 4 KiB), before any other taking can answer that nothing
+/// was.
+pub(crate) fn take(wrote: impl FnOnce(&[(usize, u16)])) {
     if !on() {
         return;
     }
@@ -336,6 +337,16 @@ mod tests {
                 "round {round}: still guarded"
             );
             told(at, block, &mut asked, &format!("round {round}"));
+        }
+        // Told by the 4 KiB part: a store in one part of the block, the journal
+        // says that part alone was written (a refresh copies it, not the block).
+        for part in [0usize, 5, 15, 9] {
+            let before = asked;
+            // (The store writes 0x100 bytes on from where it is given.)
+            store(block + part * 4096, 0x5200 + part as u32);
+            told(at, block, &mut asked, &format!("part {part}"));
+            let parts = crate::watch::parts_written(&[(block / BLOCK, before)]);
+            assert_eq!(parts, vec![1u16 << part], "part {part}: {parts:?}");
         }
         assert_eq!(PATCHER.get().unwrap().stats().patched, 1);
         assert_eq!(FAULTS.load(Ordering::Relaxed), 1, "one fault, the first");
