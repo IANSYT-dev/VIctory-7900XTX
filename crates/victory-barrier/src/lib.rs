@@ -88,6 +88,11 @@ pub struct Config {
     /// did not prove it safe (`VICTORY_BARRIER_RELOCATE=1`; a computed jump
     /// into a moved span crashes the title).
     pub relocate: bool,
+    /// Allow `int3` sites (`VICTORY_BARRIER_INT3=1`). Off, a store that only
+    /// an `int3` could send to its trampoline is refused and faults as
+    /// before: an `int3` traps at every execution, a guard once a block per
+    /// refresh, so a hot short store can cost more on `int3`.
+    pub int3: bool,
     /// The images whose code is patched (the title's): their bases. Code
     /// of any other image, or no image, is left to the guards.
     pub images: Vec<u64>,
@@ -594,8 +599,10 @@ impl Patcher {
             (Strategy::BlockStart, span)
         } else if let Some(span) = relocatable.filter(|_| self.config.relocate) {
             (Strategy::RelocateUnproven, span)
-        } else {
+        } else if self.config.int3 {
             (Strategy::Int3, vec![first])
+        } else {
+            return Err(Refusal::Int3Off);
         };
         // Where the jump goes: the store, or its block's start.
         let site = span[0].ip();

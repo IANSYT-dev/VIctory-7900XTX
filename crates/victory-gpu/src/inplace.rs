@@ -288,6 +288,22 @@ struct Views {
     /// Our own view of a whole section, by its handle (0: the host gave
     /// none), made when first asked for ([`beside`]) and kept.
     whole: Vec<(usize, usize)>,
+    /// The same by address: (first byte, past the last, the section), for
+    /// [`views_of_beside`]; made again whenever `whole` changes.
+    whole_by_address: Vec<(usize, usize, usize)>,
+}
+
+impl Views {
+    fn whole_changed(&mut self) {
+        let bytes: std::collections::HashMap<usize, u64> = self.sections.iter().map(|s| (s.0, s.1)).collect();
+        self.whole_by_address = self
+            .whole
+            .iter()
+            .filter(|w| w.1 != 0)
+            .filter_map(|&(section, base)| Some((base, base + *bytes.get(&section)? as usize, section)))
+            .collect();
+        self.whole_by_address.sort_unstable();
+    }
 }
 
 /// Read by many threads at once (write faults, landings), changed when the
@@ -298,6 +314,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     pages_twice: 0,
     sections: Vec::new(),
     whole: Vec::new(),
+    whole_by_address: Vec::new(),
 });
 
 fn views() -> std::sync::RwLockReadGuard<'static, Views> {
@@ -317,6 +334,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // had it before (it stays mapped: someone may be writing through it).
     v.whole.retain(|w| w.0 != section);
     v.sections.push((section, bytes, committed));
+    v.whole_changed();
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
@@ -325,7 +343,9 @@ pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
-        at.map(|i| v.whole.swap_remove(i).1)
+        let gone = at.map(|i| v.whole.swap_remove(i).1);
+        v.whole_changed();
+        gone
     };
     if let Some(base) = whole.filter(|&base| base != 0) {
         // SAFETY: a view of ours. Who writes through it found the section
@@ -603,6 +623,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
             }
             v.whole.push((section, base));
+            v.whole_changed();
             base
         }
     };
@@ -643,14 +664,7 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
 /// left out.
 pub(crate) fn views_of_beside(ours: &[u64]) -> Vec<usize> {
     let v = views();
-    let bytes: std::collections::HashMap<usize, u64> = v.sections.iter().map(|s| (s.0, s.1)).collect();
-    let mut wholes: Vec<(usize, usize, usize)> = v
-        .whole
-        .iter()
-        .filter(|w| w.1 != 0)
-        .filter_map(|&(section, base)| Some((base, base + *bytes.get(&section)? as usize, section)))
-        .collect();
-    wholes.sort_unstable();
+    let wholes = &v.whole_by_address;
     let mut shown = Vec::new();
     for &at in ours {
         let at = at as usize;

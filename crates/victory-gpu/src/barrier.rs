@@ -32,9 +32,23 @@ const BLOCK: usize = 1 << 16;
 static PATCHER: OnceLock<&'static Patcher> = OnceLock::new();
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 static DELTAS: AtomicU64 = AtomicU64::new(0);
+/// Pieces of the title's `memcpy`, `memmove` and `memset` put beside their
+/// guards by a block's delta ([`beside`]).
+static COPIED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Barriers off for this thread's copies and faults (a test that
+    /// compares the ways of copying).
+    pub(crate) static OFF_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Whether barriers are asked for (and possible on this processor).
 pub fn on() -> bool {
+    #[cfg(test)]
+    if OFF_IN_TEST.get() {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let asked = std::env::var_os("VICTORY_BARRIERS").is_some_and(|v| v == "1");
@@ -65,9 +79,10 @@ pub fn start(images: Vec<usize>) {
             return;
         };
         let relocate = std::env::var_os("VICTORY_BARRIER_RELOCATE").is_some_and(|v| v == "1");
+        let int3 = std::env::var_os("VICTORY_BARRIER_INT3").is_some_and(|v| v == "1");
         let images: Vec<u64> = images.iter().map(|&b| b as u64).collect();
         // SAFETY: the tables are statics of `victory_barrier`.
-        let patcher = match unsafe { Patcher::new(t, Config { relocate, images: images.clone() }) } {
+        let patcher = match unsafe { Patcher::new(t, Config { relocate, int3, images: images.clone() }) } {
             Ok(p) => &*Box::leak(Box::new(p)),
             Err(e) => {
                 tracing::warn!(error = %e, "VICTORY_BARRIERS: barriers stay off");
@@ -110,6 +125,7 @@ fn say(patcher: &'static Patcher) {
                     threads_moved = s.redirected_threads,
                     patching_ms = s.patch_ns / 1_000_000,
                     faults_seen = FAULTS.load(Ordering::Relaxed),
+                copy_pieces_beside = COPIED.load(Ordering::Relaxed),
                     blocks_beside = DELTAS.load(Ordering::Relaxed),
                     "barriers"
                 );
@@ -129,22 +145,8 @@ pub(crate) fn on_fault(
         return false;
     }
     FAULTS.fetch_add(1, Ordering::Relaxed);
-    let block = at & !(BLOCK - 1);
-    if tables::delta(block as u64) == 0 {
-        // No mapping changes while our view of the page is looked up and
-        // its delta set; one that comes after clears it ([`forget`]).
-        let Some(_reading) = crate::watch::title_memory_reading_now() else {
-            return false;
-        };
-        let Some((page, _)) = crate::inplace::beside_page(block) else {
-            return false;
-        };
-        if !tables::track(page as u64, BLOCK as u64)
-            || !tables::set_delta(block as u64, page.wrapping_sub(block) as u64)
-        {
-            return false;
-        }
-        DELTAS.fetch_add(1, Ordering::Relaxed);
+    if give_delta(at).is_none() {
+        return false;
     }
     let Some(patcher) = PATCHER.get() else {
         return false;
@@ -156,6 +158,53 @@ pub(crate) fn on_fault(
             true
         }
         Outcome::Refused(_) => false,
+    }
+}
+
+/// The distance from the guarded block at `at` to our view of its page,
+/// given to the block now if it has none: what its stores add from now on.
+/// `None` if the page has no view of ours (or the mapping is changing).
+fn give_delta(at: usize) -> Option<usize> {
+    let block = at & !(BLOCK - 1);
+    let delta = tables::delta(block as u64) as usize;
+    if delta != 0 {
+        return Some(delta);
+    }
+    // No mapping changes while our view of the page is looked up and its
+    // delta set; one that comes after clears it ([`forget`]).
+    let _reading = crate::watch::title_memory_reading_now()?;
+    let (page, _) = crate::inplace::beside_page(block)?;
+    let delta = page.wrapping_sub(block);
+    if !tables::track(page as u64, BLOCK as u64) || !tables::set_delta(block as u64, delta as u64) {
+        return None;
+    }
+    DELTAS.fetch_add(1, Ordering::Relaxed);
+    Some(delta)
+}
+
+/// For a piece of a copy of the title's ([`crate::titlewrite`]) into one
+/// guarded block at `at`: what to add to its addresses to write beside the
+/// guard, after which the caller writes there and then calls [`wrote`].
+/// `None`: barriers are off, or the block cannot be given a delta.
+///
+/// Cheaper than [`crate::watch::put_beside`], which looks the page up under
+/// the mapping's and the views' locks at every piece and sets a bit at
+/// every view of it: once a block has its delta this is one table read, and
+/// [`wrote`] three byte stores. And no share per block: nothing here costs
+/// more for a block written often.
+pub(crate) fn beside(at: usize) -> Option<usize> {
+    if !on() {
+        return None;
+    }
+    give_delta(at)
+}
+
+/// A piece of a copy was written at `ours` (our view, inside one block):
+/// marked as a barrier marks.
+pub(crate) fn wrote(ours: usize) {
+    if let Some(t) = tables::tables() {
+        t.mark(ours as u64);
+        COPIED.fetch_add(1, Ordering::Relaxed);
     }
 }
 

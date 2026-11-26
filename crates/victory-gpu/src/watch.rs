@@ -1056,6 +1056,32 @@ impl Bits {
         self.piece(word).map_or(0, |piece| piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    /// `set` (or with `clear`, `clear`) of every block of `blocks`, a word at
+    /// a time. Sorts `blocks`.
+    fn set_all(&self, blocks: &mut [usize], clear: bool) {
+        blocks.sort_unstable();
+        let mut i = 0;
+        while i < blocks.len() {
+            let word = blocks[i] / 64;
+            let mut mask = 0u64;
+            while i < blocks.len() && blocks[i] / 64 == word {
+                mask |= 1 << (blocks[i] % 64);
+                i += 1;
+            }
+            if clear {
+                if let Some(piece) = self.piece(word) {
+                    piece[word % Bits::WORDS].fetch_and(!mask, std::sync::atomic::Ordering::SeqCst);
+                }
+            } else {
+                // (Makes the piece if need be.)
+                self.set(word * 64 + mask.trailing_zeros() as usize);
+                if let Some(piece) = self.piece(word) {
+                    piece[word % Bits::WORDS].fetch_or(mask, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
     /// Whether it was set, and is no more.
     fn take(&self, block: usize) -> bool {
         self.any(block, block + 1) && {
@@ -1215,12 +1241,9 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
 /// those bits; returns only once every mark taken is told.
 fn barrier_marks() {
     crate::barrier::take(|views| {
-        for &view in views {
-            BESIDE.set(view / BLOCK);
-        }
-        for &view in views {
-            PUBLISHED.clear(view / BLOCK);
-        }
+        let mut blocks: Vec<usize> = views.iter().map(|&view| view / BLOCK).collect();
+        BESIDE.set_all(&mut blocks, false);
+        PUBLISHED.set_all(&mut blocks, true);
     });
 }
 
@@ -3964,6 +3987,99 @@ mod tests {
         crate::titlewrite::ON_IN_TEST.set(false);
         drop_views(section, &[one, two], SIZE);
         crate::title_memory_section_gone(section);
+    }
+
+    /// The title's copies into guarded view memory, the three ways: plainly
+    /// (a fault and an opening per block, guarded again by the next asking),
+    /// beside the guard by `put_beside` (`VICTORY_COPY_BESIDE`), and by the
+    /// barriers' deltas; with one copy a block a frame or many, on one thread
+    /// or several. Each must leave the bytes at both views and be told at
+    /// both; what each costs is printed. Needs barriers on, and runs alone:
+    /// `VICTORY_BARRIERS=1 cargo test -p victory-gpu --release --lib copies_three_ways -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "VICTORY_BARRIERS=1, alone"]
+    fn copies_three_ways() {
+        use std::time::{Duration, Instant};
+        unsafe extern "system-unwind" fn real(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
+            // SAFETY: by the caller.
+            unsafe { std::ptr::copy(from, to, n) };
+            to
+        }
+        assert!(crate::barrier::on(), "run with VICTORY_BARRIERS=1");
+        const BLOCKS: usize = 64;
+        const SIZE: usize = BLOCKS * BLOCK;
+        const PIECE: usize = 256;
+        const FRAMES: usize = 100;
+        let wrapped = crate::titlewrite::copy_for_test(real as *const () as usize);
+        let all = |view: usize| (0..BLOCKS).map(|b| view / BLOCK + b).collect::<Vec<_>>();
+        let value = |frame: usize, b: usize| ((frame * 7 + b) as u8) | 1;
+        let mut lines = Vec::new();
+        for (pieces, threads) in [(1usize, 1usize), (64, 1), (1, 8), (64, 8)] {
+            for way in ["plain", "put_beside", "barriers"] {
+                let (section, one, two) = two_views(SIZE);
+                crate::title_memory_section(section, SIZE as u64, true);
+                for view in [one, two] {
+                    let _ = guard(view, view + SIZE);
+                    let _ = guard(view, view + SIZE);
+                }
+                let (mut copying, mut asking) = (Duration::ZERO, Duration::ZERO);
+                for frame in 0..FRAMES {
+                    // Each thread's own time, from its first copy to its last.
+                    let spent: Vec<Duration> = std::thread::scope(|s| {
+                        let handles: Vec<_> = (0..threads).map(|t| {
+                            s.spawn(move || {
+                                crate::titlewrite::ON_IN_TEST.set(way == "put_beside");
+                                crate::barrier::OFF_IN_TEST.set(way != "barriers");
+                                let began = Instant::now();
+                                // SAFETY: of that signature.
+                                let wrapped: unsafe extern "system-unwind" fn(*mut u8, *const u8, usize) -> *mut u8 =
+                                    unsafe { std::mem::transmute(wrapped) };
+                                for b in (t..BLOCKS).step_by(threads) {
+                                    let data = [value(frame, b); PIECE];
+                                    for k in 0..pieces {
+                                        let to = (one + b * BLOCK + 256 + k * PIECE) as *mut u8;
+                                        // SAFETY: inside the view; a copy as the title makes it.
+                                        unsafe {
+                                            if way == "plain" {
+                                                real(to, data.as_ptr(), PIECE);
+                                            } else {
+                                                wrapped(to, data.as_ptr(), PIECE);
+                                            }
+                                        }
+                                    }
+                                }
+                                began.elapsed()
+                            })
+                        }).collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    copying += spent.iter().sum::<Duration>();
+                    let began = Instant::now();
+                    let (told_one, told_two) = (guard(one, one + SIZE), guard(two, two + SIZE));
+                    asking += began.elapsed();
+                    assert_eq!(told_one, Some(all(one)), "{way}, frame {frame}: told at the first view");
+                    assert_eq!(told_two, Some(all(two)), "{way}, frame {frame}: told at the second");
+                    for b in [0, BLOCKS / 2, BLOCKS - 1] {
+                        // SAFETY: inside the second view.
+                        let there = unsafe { std::slice::from_raw_parts((two + b * BLOCK + 256) as *const u8, pieces * PIECE) };
+                        assert!(there.iter().all(|&x| x == value(frame, b)), "{way}, frame {frame}, block {b}");
+                    }
+                }
+                let us = |d: Duration| d.as_secs_f64() * 1e6 / FRAMES as f64;
+                lines.push(format!(
+                    "{pieces:>2} a block, {threads} thread(s), {way:>10}: copies {:8.1} us of threads' time a frame ({:.3} us a copy), askings {:6.1} us",
+                    us(copying),
+                    us(copying) / (BLOCKS * pieces) as f64,
+                    us(asking)
+                ));
+                drop_views(section, &[one, two], SIZE);
+                crate::title_memory_section_gone(section);
+            }
+        }
+        eprintln!("{BLOCKS} blocks of two views, copies of {PIECE} bytes, {FRAMES} frames (copies: the threads' own time, summed):");
+        for line in lines {
+            eprintln!("  {line}");
+        }
     }
 
     /// Of a page taken before, what is taken again is the kernel's pages

@@ -30,8 +30,11 @@ How the instruction reaches its trampoline, in order of preference:
    understood, or a leaf function bounded by padding);
 4. the same at the start of the store's basic block, when a branch target
    follows the store;
-5. one `int3`, which a breakpoint handler sends to the trampoline (a
-   kernel round trip per execution, but no protection change).
+5. one `int3`, which a breakpoint handler sends to the trampoline: only
+   with `VICTORY_BARRIER_INT3=1`. An `int3` traps at every execution, where a
+   guard faults once a block per refresh, so a hot short store can cost more
+   on `int3` than it did before; by default such a store is refused
+   (`Int3Off`) and faults as it always did.
 
 Other threads stopped inside code being moved are moved to its copy.
 Trampolines carry unwind data, so stack walks and C++ exceptions pass
@@ -65,11 +68,46 @@ block.
   such a jump counts as a branch target.
 - **`clzero`** is zeroed with plain stores (it is AMD's only; #UD on Intel).
 
+## The title's `memcpy`, `memmove` and `memset`
+
+These are imports the host serves, so no barrier is ever patched into them,
+and by `titlewrite`'s count they were a third of the write faults by time.
+With barriers on, the host binds them to `titlewrite`'s wrappers (as with
+`VICTORY_COPY_BESIDE=1`), and a piece of a copy into a guarded block goes
+beside the guard by the block's delta (given to the block there if it has
+none), then marks it: one table read and three byte stores, no lock, no
+share per block. Without a delta it goes the way it did (`put_beside` with
+`VICTORY_COPY_BESIDE=1`, else a fault).
+
+`VICTORY_BARRIERS=1 cargo test -p victory-gpu --release --lib copies_three_ways -- --ignored --nocapture`
+copies 256 bytes into each of 64 guarded blocks of a section shown twice, a
+frame at a time, then asks about both views (Ryzen 5 7600, Windows 10; one
+run, the copies' time summed over the threads):
+
+| copies a block, threads | plain (fault, open, guard again) | `put_beside` | barriers' delta | askings: plain / `put_beside` / barriers |
+|---|---:|---:|---:|---|
+| 1, 1 | 2.95 us a copy | 0.124 us | 0.088 us | 50 / 4 / 9 us a frame |
+| 64, 1 | 0.086 us | 0.079 us | 0.045 us | 56 / 56 / 7 us |
+| 1, 8 | 7.65 us | 0.270 us | 0.166 us | 51 / 4 / 7 us |
+| 64, 8 | 0.171 us | 0.178 us | 0.100 us | 51 / 52 / 7 us |
+
+- Against a fault, a copy beside the guard is 20-50 times cheaper, either
+  way, and the block keeps its guard, so the asking guards nothing again.
+- Against `put_beside`, the delta is somewhat cheaper per copy, and the
+  difference grows with threads (no locks). With more than 32 copies a block
+  between askings, `put_beside` opens the block (its share), and the copies
+  and the asking cost what the plain way does; the delta has no share.
+- With one copy a block, the asking costs ~5 us more (64 blocks): the marks
+  are turned into bits at every view there, on the thread that asks, where
+  `put_beside` does it on the title's thread at the copy. About 60 ns a
+  block written, on the thread that prepares submissions.
+
 ## Switches
 
 | Switch | |
 |---|---|
 | `VICTORY_BARRIERS=1` | on (needs BMI2, XSAVE, and `VICTORY_LIGHT_REFRESH`/`VICTORY_VIEW_GUARD` not 0) |
+| `VICTORY_BARRIER_INT3=1` | also patch stores only an `int3` can reach (see above) |
 | `VICTORY_BARRIER_RELOCATE=1` | also move code the scan did not prove safe (a computed jump into it crashes the title) |
 | `VICTORY_BARRIER_DEBUG=1` | log why each `int3` site is one |
 | `VICTORY_BARRIER_NO_UNWIND=1` | trampolines without unwind data (diagnostics only) |
@@ -80,8 +118,9 @@ seen and blocks given a delta.
 
 ## What a first run should look at
 
-- The `barriers` line: how many sites, how many on `int3`, and whether
-  `int3_hits` grows fast (a hot `int3` site costs a trap per execution).
+- The `barriers` line: how many sites, and how many refused as `Int3Off`
+  (with `VICTORY_BARRIER_INT3=1`: whether `int3_hits` grows fast; a hot
+  `int3` site costs a trap per execution).
 - Write faults a frame (the fault book, `VICTORY_FAULT_BOOK`) and the
   title threads' time in them, against a run without the switch.
 - Frame times, and anything stale on screen.
@@ -92,18 +131,22 @@ seen and blocks given a delta.
 - The title's own `VirtualProtect` of view memory: a block the title makes
   read-only keeps its delta, so a store it expects to fault goes beside.
 - Title DLLs loaded after the start are not patched.
-- `memcpy`/`memmove`/`memset` are imports served by the host; with
-  `VICTORY_COPY_BESIDE=1` they put their bytes beside the guard themselves.
 
 ## Tests
 
-- `cargo test -p victory-barrier`: classification, the tables, and a test
+- `cargo test -p victory-barrier`: classification, the tables, a test that
+  `int3` sites are refused by default, and a test
   that maps a section twice, guards one view, lets stores in the test's own
   code fault, patches them, and checks bytes, marks and that they never
   fault again.
 - `VICTORY_BARRIERS=1 cargo test -p victory-gpu --lib barrier::tests -- --ignored`
   (alone: it patches the test binary): the same through `watch`, `inplace`
   and `writes`, including a second view of the same pages.
+- `copies_three_ways` (above), which also checks the bytes at both views and
+  that both are told written, every frame, each way.
+- `VICTORY_BARRIERS=1 cargo test -p victory-gpu --lib`: all of
+  `victory-gpu`'s tests with barriers on (no patching: nothing starts the
+  scan), as without.
 
 The patcher was developed apart from VIctory, with a stand-in title, about
 30 torture cases and a differential test that runs every store form against

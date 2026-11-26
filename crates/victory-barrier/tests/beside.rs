@@ -140,6 +140,7 @@ fn stores_go_beside_the_guard_and_are_marked() {
                 t,
                 Config {
                     relocate: false,
+                    int3: true,
                     images: vec![exe],
                 },
             )

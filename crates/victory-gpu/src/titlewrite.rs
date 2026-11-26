@@ -70,6 +70,13 @@ fn copies_on() -> bool {
     asked_for!("VICTORY_COPY_BESIDE")
 }
 
+/// Whether our `memcpy`, `memmove` and `memset` look where they write: for
+/// `VICTORY_COPY_BESIDE`, or for write barriers, which put a copy's pieces
+/// beside the guard by a block's delta ([`crate::barrier::beside`]).
+fn copies_looked_at() -> bool {
+    copies_on() || crate::barrier::on()
+}
+
 fn stores_on() -> bool {
     #[cfg(test)]
     if ON_IN_TEST.get() {
@@ -100,9 +107,9 @@ pub fn import(name: &str, address: usize) -> usize {
         _ => return address,
     };
     #[cfg(feature = "diagnostics")]
-    let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || copies_on();
+    let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || copies_looked_at();
     #[cfg(not(feature = "diagnostics"))]
-    let on = copies_on();
+    let on = copies_looked_at();
     if !on {
         return address;
     }
@@ -138,7 +145,7 @@ unsafe extern "system-unwind" fn shift(to: *mut u8, from: *const u8, n: usize) -
 unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8 {
     // SAFETY: the host's function, noted by `import` before the title ran.
     let real: Copy = unsafe { std::mem::transmute(real) };
-    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_on() || overlap(to as usize, from as usize, n) {
+    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_looked_at() || overlap(to as usize, from as usize, n) {
         // SAFETY: by the caller.
         return unsafe { real(to, from, n) };
     }
@@ -157,7 +164,7 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
 unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u8 {
     // SAFETY: as in `copied`.
     let real: Set = unsafe { std::mem::transmute(REAL[2].load(Relaxed)) };
-    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_on() {
+    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_looked_at() {
         // SAFETY: the title's, as it asked for it.
         return unsafe { real(to, byte, n) };
     }
@@ -186,7 +193,7 @@ pub(crate) unsafe fn put(to: *mut u8, from: *const u8, n: usize) {
             add(8);
             return;
         }
-        if n == 0 || !copies_on() || !crate::watch::guards_any(to as usize, n) || overlap(to as usize, from as usize, n) {
+        if n == 0 || !copies_looked_at() || !crate::watch::guards_any(to as usize, n) || overlap(to as usize, from as usize, n) {
             std::ptr::copy(from, to, n);
             return;
         }
@@ -217,6 +224,20 @@ fn in_pieces(to: usize, n: usize, same: impl Fn(usize, usize, usize) -> bool, pu
         if crate::watch::guards_any(at, len) {
             if same(at, offset, len) {
                 add(7);
+                offset += len;
+                continue;
+            }
+            // The block's delta, where barriers gave it one: the bytes, then
+            // the mark, as a barrier stores and marks.
+            if let Some(delta) = crate::barrier::beside(at) {
+                put(at.wrapping_add(delta), offset, len);
+                crate::barrier::wrote(at.wrapping_add(delta));
+                offset += len;
+                continue;
+            }
+            if !copies_on() {
+                // Barriers alone: the guards' way (a fault).
+                put(at, offset, len);
                 offset += len;
                 continue;
             }

@@ -36,6 +36,10 @@ pub enum Refusal {
     Encode,
     /// No room for trampolines within reach.
     Full,
+    /// Only an `int3` could reach the trampoline, and `int3` sites are not
+    /// asked for (`Config::int3`): a trap at every execution can cost more
+    /// than the guard's fault, which comes once a block per refresh.
+    Int3Off,
 }
 
 /// How the barrier computes the address the title meant.

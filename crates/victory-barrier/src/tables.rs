@@ -14,7 +14,7 @@
 //! at whether a taking is under way.
 
 use crate::layout::{
-    BLOCK_SHIFT, BLOCKS_PER_SLOT, COARSE_SHIFT, COARSES_PER_SLOT, MID_SHIFT, MIDS_PER_SLOT,
+    BLOCK_SHIFT, BLOCK_SHR, BLOCKS_PER_SLOT, COARSE_SHIFT, COARSES_PER_SLOT, MID_SHIFT, MIDS_PER_SLOT,
     SLOT_SHIFT, SLOTS, Tables, index, slot,
 };
 use std::sync::Mutex;
@@ -118,7 +118,7 @@ pub fn set_delta(block: u64, delta: u64) -> bool {
         return false;
     };
     // SAFETY: the slot's array holds every block's delta.
-    unsafe { (*deltas.add(index(block, crate::layout::BLOCK_SHR))).store(delta, Ordering::SeqCst) };
+    unsafe { (*deltas.add(index(block, BLOCK_SHR))).store(delta, Ordering::SeqCst) };
     true
 }
 
@@ -127,27 +127,35 @@ pub fn delta(at: u64) -> u64 {
     tables().map_or(0, |t| t.resolve(at).wrapping_sub(at))
 }
 
-/// Stores into `[from, to)` go where the title meant from now on.
+/// Stores into `[from, to)` go where the title meant from now on. Any
+/// range: what lies past user space (where no delta can be) is left out, and
+/// only slots with deltas of their own are looked at.
 pub fn clear(from: u64, to: u64) {
+    /// The end of the 47-bit user address space.
+    const USER_END: u64 = 1 << 47;
     let Some(shared) = SHARED.get().map(|s| s[0]) else {
         return;
     };
-    let mut at = from & !((1 << BLOCK_SHIFT) - 1);
-    while at < to {
-        let s = slot(at);
-        let slot_end = ((at >> SLOT_SHIFT) + 1) << SLOT_SHIFT;
-        let deltas = DELTA[s].load(Ordering::Acquire);
+    let (from, to) = (from.min(USER_END), to.min(USER_END));
+    if from >= to {
+        return;
+    }
+    for s in (from >> SLOT_SHIFT)..=((to - 1) >> SLOT_SHIFT) {
+        let deltas = DELTA[s as usize].load(Ordering::Acquire);
         if deltas == shared {
-            at = slot_end;
             continue;
         }
         let deltas = deltas as *const AtomicU64;
-        while at < to.min(slot_end) {
+        let base = s << SLOT_SHIFT;
+        let (lo, hi) = (from.max(base), to.min(base + (1 << SLOT_SHIFT)));
+        for b in index(lo, BLOCK_SHR)..=index(hi - 1, BLOCK_SHR) {
             // SAFETY: as in `set_delta`.
-            unsafe {
-                (*deltas.add(index(at, crate::layout::BLOCK_SHR))).store(0, Ordering::SeqCst)
-            };
-            at += 1 << BLOCK_SHIFT;
+            let delta = unsafe { &*deltas.add(b) };
+            // (Not written where it is 0: a page of the table never given a
+            // delta stays untouched.)
+            if delta.load(Ordering::Relaxed) != 0 {
+                delta.store(0, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -272,6 +280,18 @@ mod tests {
         let mut again = Vec::new();
         take(|b| again.extend_from_slice(b));
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn clearing_any_range_ends() {
+        let at = 0x7123_4570_0000u64;
+        assert!(set_delta(at, 0x1000_0000));
+        clear(u64::MAX - 5, u64::MAX);
+        clear(0, u64::MAX);
+        assert_eq!(delta(at), 0);
+        assert!(set_delta(at, 0x1000_0000));
+        clear(at - (1 << 40), at + 1);
+        assert_eq!(delta(at), 0);
     }
 
     #[test]
