@@ -95,6 +95,13 @@ impl Frozen {
         Self { threads }
     }
 
+    /// Each stopped thread's instruction pointer, to `f`. Allocates nothing.
+    pub fn each_rip(&self, mut f: impl FnMut(u64)) {
+        for t in &self.threads {
+            f(t.1.0.Rip);
+        }
+    }
+
     /// Moves the stopped threads `to` names: `to(rip)` is `None` to leave a
     /// thread, `Some(Some(new))` to move it to `new`, `Some(None)` for one
     /// that cannot be moved. How many were moved, or `None` (and none moved)

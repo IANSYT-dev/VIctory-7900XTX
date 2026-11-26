@@ -133,6 +133,22 @@ Every 10 s while it changes, a `barriers` line: sites patched by strategy,
 refusals by reason, `int3` hits, threads moved, time spent patching, faults
 seen and blocks given a delta.
 
+## Sites remembered between runs
+
+Patching a site stops the process's other threads for a moment, so the
+first minutes of a run, when most sites are met, would stutter. The sites
+patched are written to `<cache>/barriers/sites.txt` every 10 s while they
+change: a line each, the image's file name and PE time stamp, the site's
+offset in it and a hash of its instruction (offsets and hashes, no code of
+the title's). The next run patches them as soon as the image is scanned,
+all under one stop of the threads (`Patcher::patch_many`); a line whose image
+is another build, or whose instruction is no longer the one hashed, is left
+out. A store the title only reaches later is patched at its first fault, as
+before.
+
+Title DLLs the title loads itself (`LoadLibrary`) are scanned and patched
+like its first images, from their own remembered sites.
+
 ## What a first run should look at
 
 - The `barriers` line: how many sites, and how many refused as `Int3Off`
@@ -160,18 +176,31 @@ seen and blocks given a delta.
   once a run says what those cost.
 - The title's own `VirtualProtect` of view memory: a block the title makes
   read-only keeps its delta, so a store it expects to fault goes beside.
-- Title DLLs loaded after the start are not patched.
 
 ## Tests
 
 - `cargo test -p victory-barrier`: classification, the tables, a test that
-  `int3` sites are refused by default, and a test
-  that maps a section twice, guards one view, lets stores in the test's own
-  code fault, patches them, and checks bytes, marks and that they never
-  fault again.
+  `int3` sites are refused by default, one of sites patched ahead under one
+  stop, and one that maps a section twice, guards one view, lets stores in
+  the test's own code fault, patches them, and checks bytes, marks and that
+  they never fault again.
+- `tests/difftest.rs`: every store form the classifier accepts, in this
+  test's code and Windows DLLs, run as the original instruction and as its
+  trampoline from the same random state; registers, flags, vector state,
+  memory, faults and the marks (by `tables::take`, at 4 KiB parts) must
+  agree, and three ways of breaking a trampoline on purpose must be seen. Any
+  images, every instance: `VICTORY_BARRIER_DIFFTEST="a.exe;b.dll"
+  VICTORY_BARRIER_DIFFTEST_PER_FORM=100000 cargo test -p victory-barrier
+  --release --test difftest -- --ignored --nocapture`. Windows' DLLs and the
+  prototype's stand-in title: 307 forms, all 117,862 instances, 471,368 paired
+  runs (2,852 faulting alike), no difference. Its debug build found that a
+  jump table's bound compared to a register was read as a constant (a table
+  of one entry, its other targets missed); such a table is now read
+  unbounded.
 - `VICTORY_BARRIERS=1 cargo test -p victory-gpu --lib barrier::tests -- --ignored`
   (alone: it patches the test binary): the same through `watch`, `inplace`
-  and `writes`, including a second view of the same pages.
+  and `writes`, including a second view of the same pages, the 4 KiB part
+  each store wrote, and the sites file.
 - `copies_three_ways` (above), which also checks the bytes at both views and
   that both are told written, every frame, each way.
 - `VICTORY_BARRIERS=1 cargo test -p victory-gpu --lib`: all of

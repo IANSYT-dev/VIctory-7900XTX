@@ -148,7 +148,7 @@ fn stores_go_beside_the_guard_and_are_marked() {
         .expect("patcher"),
     ));
     assert!(
-        patcher.prepare(exe).is_some(),
+        unsafe { patcher.prepare(exe) }.is_some(),
         "the scan of this test's image"
     );
     handler::install(patcher).expect("breakpoint handler");
@@ -218,7 +218,11 @@ fn stores_go_beside_the_guard_and_are_marked() {
         }
         assert_eq!(
             marked,
-            vec![(ours + BLOCK, 1), (ours + 2 * BLOCK, 1), (ours + 3 * BLOCK, 1)],
+            vec![
+                (ours + BLOCK, 1),
+                (ours + 2 * BLOCK, 1),
+                (ours + 3 * BLOCK, 1)
+            ],
             "round {round}: marks at our view's blocks, each in its first 4 KiB"
         );
     }

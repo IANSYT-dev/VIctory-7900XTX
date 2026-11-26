@@ -218,9 +218,13 @@ pub fn run(
     // the patches above (it keeps clear of their jumps).
     #[cfg(windows)]
     if execute && victory_hle::barrier::on() {
-        let images: Vec<usize> = std::iter::once(image.base()).chain(dlls.iter().map(|(_, dll)| dll.base())).collect();
+        let images: Vec<(usize, String)> = std::iter::once((image.base(), exe.file_name().unwrap_or_default().to_string_lossy().into_owned()))
+            .chain(dlls.iter().map(|(name, dll)| (dll.base(), name.clone())))
+            .collect();
         println!("write barriers: scanning {} title image(s)", images.len());
-        victory_hle::barrier::start(images);
+        // The sites patched are remembered, and patched ahead next time.
+        let sites = cfg.cache_subdir("barriers").ok().map(|dir| dir.join("sites.txt"));
+        victory_hle::barrier::start(images, sites);
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -459,6 +463,10 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    // Write barriers (VICTORY_BARRIERS=1): scanned and
+                    // patched like the title's first images.
+                    #[cfg(windows)]
+                    victory_hle::barrier::image_loaded(dll.base(), name);
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

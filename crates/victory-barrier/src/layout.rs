@@ -174,15 +174,7 @@ mod tests {
         let base = 0x6000_0000_0000u64 + (5 << BLOCK_SHIFT);
         for shr in [PART_SHR, BLOCK_SHR, MID_SHR, COARSE_SHR] {
             for ea in (base - 70_000..base + 70_000).step_by(997) {
-                for size in [
-                    1u64,
-                    2,
-                    8,
-                    64,
-                    2696,
-                    4095,
-                    u64::from(INLINE_STORE_MAX),
-                ] {
+                for size in [1u64, 2, 8, 64, 2696, 4095, u64::from(INLINE_STORE_MAX)] {
                     let (a, b) = (index(ea, shr), index(ea + size - 1, shr));
                     let units = (ea..ea + size).step_by(61).chain([ea + size - 1]);
                     assert!(

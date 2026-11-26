@@ -1084,7 +1084,22 @@ impl Text {
                 && i.op_kind(0) == OpKind::Register
                 && i.op0_register().full_register() == index
             {
-                if let Some(next) = window.get(k + 1) {
+                // Only a constant bound is read; a register's (`cmp index,
+                // reg`) is not known here, and the table is read unbounded,
+                // which only adds targets. (Read as 0 before: the table was
+                // taken to have one entry, and its other targets missed.)
+                let constant = matches!(
+                    i.op_kind(1),
+                    OpKind::Immediate8
+                        | OpKind::Immediate16
+                        | OpKind::Immediate32
+                        | OpKind::Immediate64
+                        | OpKind::Immediate8to16
+                        | OpKind::Immediate8to32
+                        | OpKind::Immediate8to64
+                        | OpKind::Immediate32to64
+                );
+                if let Some(next) = window.get(k + 1).filter(|_| constant) {
                     let n = i.immediate(1);
                     bound = match next.mnemonic() {
                         Mnemonic::Ja => Some(n + 1),
@@ -1289,21 +1304,6 @@ impl Text {
         !self.image || (at >= self.base && at - self.base < self.size)
     }
 
-    /// Short reason relocation at `ip` is not proven, for counting.
-    pub fn unproven_kind(&self, ip: u64) -> &'static str {
-        if !self.image {
-            return "generated code";
-        }
-        let i = self.functions.partition_point(|f| f.0 <= ip);
-        match i.checked_sub(1).filter(|&i| ip < self.functions[i].1) {
-            None => "no .pdata (leaf or assembly)",
-            Some(i) if self.closed[i] => "proven",
-            Some(i) if self.open_why[i] == 0 => "exception handler not understood",
-            Some(i) if self.open_why[i] == FOREIGN => "another layer's patch jumps out of it",
-            Some(_) => "indirect jump not read",
-        }
-    }
-
     /// Why relocation at `ip` is not proven, for diagnostics.
     pub fn why_not_proven(&self, ip: u64) -> String {
         if !self.image {
@@ -1330,11 +1330,6 @@ impl Text {
     /// Whether `ip` is entered from outside the flow the scan follows.
     fn is_external(&self, ip: u64) -> bool {
         self.external.binary_search(&ip).is_ok()
-    }
-
-    /// Whether the scan knows of a branch to `ip`.
-    pub fn is_target(&self, ip: u64) -> bool {
-        self.targets.binary_search(&ip).is_ok()
     }
 
     /// Whether something branches to an address in `(from, to)`.

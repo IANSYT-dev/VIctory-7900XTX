@@ -49,7 +49,6 @@ pub mod classify;
 pub mod emit;
 pub mod handler;
 pub mod layout;
-pub mod shape;
 pub mod string;
 pub mod tables;
 pub mod text;
@@ -133,6 +132,55 @@ struct Record {
     island: Option<(u64, [u8; 5])>,
     strategy: Strategy,
     moved: Vec<u64>,
+    /// A hash of the store instruction's own bytes before it was patched.
+    hash: u64,
+}
+
+/// A patch made ready ([`Patcher::stage`]) and not yet written.
+struct Staged {
+    rip: u64,
+    site: u64,
+    span_len: usize,
+    site_bytes: Vec<u8>,
+    island: Option<(u64, [u8; 5])>,
+    strategy: Strategy,
+    moved: Vec<(u64, u64)>,
+    string: bool,
+    hash: u64,
+}
+
+impl Staged {
+    /// Whether a thread stopped at `ip` is inside what the site's bytes
+    /// overwrite (not at its first instruction).
+    fn in_span(&self, ip: u64) -> bool {
+        ip > self.site && ip < self.site + self.span_len as u64
+    }
+
+    /// Where a thread stopped at `ip` in the span goes: its instruction's copy.
+    fn moved_to(&self, ip: u64) -> Option<u64> {
+        self.moved.iter().find(|m| m.0 == ip).map(|m| m.1)
+    }
+}
+
+/// The length of the instruction at `ip`, decoded from no further than `end`;
+/// `None` if none decodes there.
+pub fn instruction_len(ip: u64, end: u64) -> Option<usize> {
+    if ip >= end {
+        return None;
+    }
+    // SAFETY: the caller's code, mapped up to `end`.
+    let bytes = unsafe { std::slice::from_raw_parts(ip as *const u8, (end - ip).min(15) as usize) };
+    let i = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE).decode();
+    (!i.is_invalid()).then_some(i.len())
+}
+
+/// FNV-1a of the instruction at `ip` (its own bytes, `len` of them).
+pub fn instruction_hash(ip: u64, len: usize) -> u64 {
+    // SAFETY: an instruction's bytes, which the caller decoded there.
+    let bytes = unsafe { std::slice::from_raw_parts(ip as *const u8, len) };
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 enum Site {
@@ -184,6 +232,8 @@ pub struct Patcher {
     inner: Mutex<Inner>,
     /// int3 sites → their trampolines, read by the breakpoint handler.
     breakpoints: RwLock<HashMap<u64, u64>>,
+    /// The images patched (`Config::images`, then each [`Self::prepare`]d).
+    images: RwLock<Vec<u64>>,
     /// Trampoline areas, read without the lock: (start, end).
     area_bounds: RwLock<Vec<(u64, u64)>>,
     string_sites: AtomicU64,
@@ -197,6 +247,7 @@ impl Patcher {
     ///
     /// `tables` stay valid while barriers run.
     pub unsafe fn new(tables: Tables, config: Config) -> Result<Self, String> {
+        let images = config.images.clone();
         let cpu = std::arch::is_x86_feature_detected!("bmi2")
             && std::arch::is_x86_feature_detected!("xsave");
         if !cpu {
@@ -221,6 +272,7 @@ impl Patcher {
                 repatched: 0,
             }),
             breakpoints: RwLock::new(HashMap::new()),
+            images: RwLock::new(images),
             area_bounds: RwLock::new(Vec::new()),
             string_sites: AtomicU64::new(0),
             redirected: AtomicU64::new(0),
@@ -229,10 +281,35 @@ impl Patcher {
         })
     }
 
-    /// Scans an image ahead of its first fault (the title, at load).
-    pub fn prepare(&self, module: u64) -> Option<usize> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        self.text_of(&mut inner, module).map(|t| t.target_count())
+    /// Scans an image ahead of its first fault, and patches it from then on
+    /// (the title, at load; a DLL it loads later). The scan, which can take
+    /// seconds, holds no lock: faults meanwhile are refused (`NotPatchable`)
+    /// and go on as before. The number of branch targets found.
+    ///
+    /// # Safety
+    /// `module` is a loaded image (headers and sections mapped) that stays.
+    pub unsafe fn prepare(&self, module: u64) -> Option<usize> {
+        // SAFETY: by the caller.
+        let text = Arc::new(unsafe { Text::read(module) }?);
+        let targets = text.target_count();
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .texts
+            .insert(module, text);
+        let mut images = self.images.write().unwrap_or_else(|e| e.into_inner());
+        if !images.contains(&module) {
+            images.push(module);
+        }
+        Some(targets)
+    }
+
+    /// Whether the image at `base` is scanned and its stores are patched.
+    pub fn patches(&self, base: u64) -> bool {
+        self.images
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&base)
     }
 
     pub fn in_trampolines(&self, ip: u64) -> bool {
@@ -259,7 +336,12 @@ impl Patcher {
             let base = module as u64;
             // (The host's own image is never among them in VIctory; a test's
             // is, standing for the title.)
-            if !self.config.images.contains(&base) {
+            if !self
+                .images
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&base)
+            {
                 return None;
             }
             let text = match inner.texts.get(&base) {
@@ -363,13 +445,7 @@ impl Patcher {
                 }
             }
             Err(r) => {
-                *inner.refused_faults.entry(r).or_default() += 1;
-                // A thread in the way is a matter of timing: try again next
-                // time. Everything else is a property of the site.
-                if r != Refusal::ThreadInSpan {
-                    inner.sites.insert(*rip, Site::Refused(r));
-                    *inner.refusals.entry(r).or_default() += 1;
-                }
+                self.settle(&mut inner, *rip, &Err(r));
                 Outcome::Refused(r)
             }
         }
@@ -550,12 +626,12 @@ impl Patcher {
             .is_some_and(|(_, &end)| end > from)
     }
 
-    fn patch(
-        &self,
-        inner: &mut Inner,
-        text: &Text,
-        rip: u64,
-    ) -> Result<(Record, Option<u64>), Refusal> {
+    /// Everything for patching the store at `rip` but the writing: the
+    /// strategy, the trampoline (put in its area, with unwind data), the
+    /// bytes for the site. The bytes it will write are reserved against later
+    /// spans and islands, and an int3 site's trampoline is told to the
+    /// breakpoint handler; [`Self::unstage`] gives those back.
+    fn stage(&self, inner: &mut Inner, text: &Text, rip: u64) -> Result<Staged, Refusal> {
         let first = Self::decode(text, rip);
         let store = classify::classify(&first, &mut inner.factory, self.xsave_bytes)?;
         let len = first.len();
@@ -684,22 +760,71 @@ impl Patcher {
         if strategy == Strategy::Int3 {
             self.breakpoints.write().unwrap().insert(rip, at);
         }
-        let forget_breakpoint = |this: &Self| {
-            if strategy == Strategy::Int3 {
-                this.breakpoints.write().unwrap().remove(&rip);
-            }
-        };
-        // Everything allocated; now stop the world for the write.
+        let area = inner.areas.iter_mut().find(|a| a.next == at).unwrap();
+        area.next = (at + encoded.code.len() as u64 + 15) & !15;
+        inner.written.insert(site, site + site_bytes.len() as u64);
+        if let Some((island, _)) = island_bytes {
+            inner.islands.insert(island);
+        }
+        Ok(Staged {
+            rip,
+            site,
+            span_len,
+            site_bytes,
+            island: island_bytes,
+            strategy,
+            moved: encoded.moved,
+            string: matches!(store, Store::String { .. }),
+            hash: instruction_hash(rip, len),
+        })
+    }
+
+    /// Gives back what [`Self::stage`] reserved, for a patch not written.
+    /// (The trampoline's room is not reused.)
+    fn unstage(&self, inner: &mut Inner, staged: &Staged) {
+        inner.written.remove(&staged.site);
+        if let Some((island, _)) = staged.island {
+            inner.islands.remove(&island);
+        }
+        if staged.strategy == Strategy::Int3 {
+            self.breakpoints.write().unwrap().remove(&staged.rip);
+        }
+    }
+
+    /// Writes `staged` patches with the other threads stopped once. A thread
+    /// stopped inside a span goes to its instruction's copy; a patch with a
+    /// thread where it cannot go (between instructions) is not written
+    /// (`ThreadInSpan`, tried again at its next fault). For each: its
+    /// record, and where a block-start patch moved the store itself.
+    fn commit(
+        &self,
+        inner: &mut Inner,
+        staged: Vec<Staged>,
+    ) -> Vec<(u64, Result<(Record, Option<u64>), Refusal>)> {
+        // Made before the others stop: nothing may allocate meanwhile.
+        let mut outcome: Vec<Option<Refusal>> = vec![None; staged.len()];
         let mut frozen = threads::Frozen::others();
-        let in_span = |ip: u64| ip > site && ip < site + span_len as u64;
-        let redirects = frozen.redirect(|ip| {
-            in_span(ip).then(|| encoded.moved.iter().find(|m| m.0 == ip).map(|m| m.1))
+        frozen.each_rip(|ip| {
+            for (k, s) in staged.iter().enumerate() {
+                if s.in_span(ip) && s.moved_to(ip).is_none() {
+                    outcome[k] = Some(Refusal::ThreadInSpan);
+                }
+            }
         });
-        let Some(redirects) = redirects else {
-            drop(frozen);
-            forget_breakpoint(self);
-            return Err(Refusal::ThreadInSpan);
-        };
+        let redirects = frozen.redirect(|ip| {
+            staged
+                .iter()
+                .enumerate()
+                .find(|(k, s)| outcome[*k].is_none() && s.in_span(ip))
+                .map(|(_, s)| s.moved_to(ip))
+        });
+        if redirects.is_none() {
+            // A thread could not be moved: nothing is written. (Threads
+            // moved already run the copies, which do the same.)
+            outcome
+                .iter_mut()
+                .for_each(|o| *o = Some(Refusal::ThreadInSpan));
+        }
         let write = |to: u64, bytes: &[u8]| -> Result<(), Refusal> {
             let mut old: PAGE_PROTECTION_FLAGS = 0;
             // SAFETY: code bytes of the site or its island; other threads
@@ -720,39 +845,120 @@ impl Patcher {
             }
             Ok(())
         };
-        let written = island_bytes
-            .map_or(Ok(()), |(island, bytes)| write(island, &bytes))
-            .and_then(|()| write(site, &site_bytes));
+        for (k, s) in staged.iter().enumerate() {
+            if outcome[k].is_none() {
+                let written = s
+                    .island
+                    .map_or(Ok(()), |(island, bytes)| write(island, &bytes))
+                    .and_then(|()| write(s.site, &s.site_bytes));
+                outcome[k] = written.err();
+            }
+        }
         drop(frozen);
-        if let Err(e) = written {
-            forget_breakpoint(self);
-            return Err(e);
-        }
+        self.redirected
+            .fetch_add(redirects.unwrap_or(0), Ordering::Relaxed);
+        staged
+            .into_iter()
+            .zip(outcome)
+            .map(|(s, refused)| {
+                if let Some(r) = refused {
+                    self.unstage(inner, &s);
+                    return (s.rip, Err(r));
+                }
+                inner.moved.extend(s.moved.iter().copied());
+                if s.string {
+                    self.string_sites.fetch_add(1, Ordering::Relaxed);
+                }
+                let moved_to = (s.site != s.rip).then(|| s.moved_to(s.rip)).flatten();
+                let record = Record {
+                    at: s.site,
+                    written: s.site_bytes,
+                    island: s.island,
+                    strategy: s.strategy,
+                    moved: s.moved.iter().map(|m| m.0).collect(),
+                    hash: s.hash,
+                };
+                (s.rip, Ok((record, moved_to)))
+            })
+            .collect()
+    }
 
-        let area = inner.areas.iter_mut().find(|a| a.next == at).unwrap();
-        area.next = (at + encoded.code.len() as u64 + 15) & !15;
-        inner.moved.extend(encoded.moved.iter().copied());
-        if let Some((island, _)) = island_bytes {
-            inner.islands.insert(island);
+    fn patch(
+        &self,
+        inner: &mut Inner,
+        text: &Text,
+        rip: u64,
+    ) -> Result<(Record, Option<u64>), Refusal> {
+        let staged = self.stage(inner, text, rip)?;
+        self.commit(inner, vec![staged]).pop().expect("one patch").1
+    }
+
+    /// Notes what became of patching the store at `rip`.
+    fn settle(&self, inner: &mut Inner, rip: u64, result: &Result<Record, Refusal>) {
+        match result {
+            Ok(record) => *inner.strategies.entry(record.strategy).or_default() += 1,
+            Err(r) => {
+                *inner.refused_faults.entry(*r).or_default() += 1;
+                // A thread in the way is a matter of timing: try again next
+                // time. Everything else is a property of the site.
+                if *r != Refusal::ThreadInSpan {
+                    inner.sites.insert(rip, Site::Refused(*r));
+                    *inner.refusals.entry(*r).or_default() += 1;
+                }
+            }
         }
-        inner.written.insert(site, site + site_bytes.len() as u64);
-        self.redirected.fetch_add(redirects, Ordering::Relaxed);
-        if matches!(store, Store::String { .. }) {
-            self.string_sites.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Patches the stores at `rips` that are not patched yet (the sites a run
+    /// before this one patched, [`Self::patched_sites`]), with the other
+    /// threads stopped once for all of them. A store inside another's moved
+    /// span is left (its barrier is in that span's trampoline). How many
+    /// were patched.
+    pub fn patch_many(&self, rips: &[u64]) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let began = std::time::Instant::now();
+        let mut staged = Vec::new();
+        for &rip in rips {
+            if inner.sites.contains_key(&rip) || Self::overlaps_patch(&inner, rip, rip + 1) {
+                continue;
+            }
+            let Some(text) = self.text_of(&mut inner, rip) else {
+                continue;
+            };
+            match self.stage(&mut inner, &text, rip) {
+                Ok(s) => staged.push(s),
+                Err(r) => self.settle(&mut inner, rip, &Err(r)),
+            }
         }
-        let moved_to = (site != rip)
-            .then(|| encoded.moved.iter().find(|m| m.0 == rip).map(|m| m.1))
-            .flatten();
-        Ok((
-            Record {
-                at: site,
-                written: site_bytes,
-                island: island_bytes,
-                strategy,
-                moved: encoded.moved.iter().map(|m| m.0).collect(),
-            },
-            moved_to,
-        ))
+        let mut done = 0;
+        for (rip, result) in self.commit(&mut inner, staged) {
+            let result = result.map(|(record, _)| record);
+            self.settle(&mut inner, rip, &result);
+            if let Ok(record) = result {
+                inner.sites.insert(rip, Site::Patched(record));
+                done += 1;
+            }
+        }
+        self.patch_ns
+            .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        done
+    }
+
+    /// The stores patched so far: where, and a hash of the instruction they
+    /// were ([`instruction_hash`]), to be patched ahead next time
+    /// ([`Self::patch_many`]) where that instruction is still there.
+    pub fn patched_sites(&self) -> Vec<(u64, u64)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sites: Vec<(u64, u64)> = inner
+            .sites
+            .iter()
+            .filter_map(|(&rip, site)| match site {
+                Site::Patched(record) => Some((rip, record.hash)),
+                Site::Refused(_) => None,
+            })
+            .collect();
+        sites.sort_unstable();
+        sites
     }
 
     pub fn stats(&self) -> PatchStats {
@@ -776,179 +982,20 @@ impl Patcher {
     }
 }
 
-/// Where every store instruction of an image would end up, without
-/// running it: `xbc survey`.
-#[derive(Default, Debug)]
-pub struct Survey {
-    pub instructions: u64,
-    /// Stores through rsp: the stack, which the patcher never sees.
-    pub stack_stores: u64,
-    pub strategies: BTreeMap<Strategy, u64>,
-    pub refused: BTreeMap<Refusal, u64>,
-    /// Why short stores ended on int3.
-    pub int3_why: BTreeMap<&'static str, u64>,
-    /// Anonymised shapes around what is left on int3, by kind: how many
-    /// times each shape occurs.
-    pub shapes: BTreeMap<&'static str, HashMap<String, u64>>,
-}
-
-/// Classifies every instruction of `text`'s code sections (a linear sweep,
-/// so data in code adds some noise) as the patcher would on a fault.
-pub fn survey(text: &Text) -> Survey {
-    let mut s = Survey::default();
-    for (window, jmp) in &text.unread {
-        let mut list: Vec<Instruction> = window.iter().rev().take(10).rev().copied().collect();
-        list.push(*jmp);
-        *s.shapes
-            .entry("indirect jump not read")
-            .or_default()
-            .entry(shape::render(&list, text, None))
-            .or_default() += 1;
-    }
-    let mut recent: Vec<Instruction> = Vec::with_capacity(8);
-    let mut factory = InstructionInfoFactory::new();
-    let xsave = string::xsave_area_bytes();
-    let taken = BTreeSet::new();
-    for &(start, end) in &text.sections {
-        // SAFETY: an executable section of a loaded image.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(start as *const u8, (end - start) as usize) };
-        for instr in Decoder::with_ip(64, bytes, start, DecoderOptions::NONE) {
-            s.instructions += 1;
-            if recent.len() == 6 {
-                recent.remove(0);
-            }
-            let before = recent.clone();
-            recent.push(instr);
-            match classify::classify(&instr, &mut factory, xsave) {
-                Err(Refusal::NotAStore | Refusal::Undecodable) => {}
-                Err(Refusal::Stack) => s.stack_stores += 1,
-                Err(r) => {
-                    if std::env::var_os("VICTORY_BARRIER_DEBUG").is_some()
-                        && r == Refusal::NoScratch
-                    {
-                        use iced_x86::Formatter;
-                        let mut t = String::new();
-                        iced_x86::IntelFormatter::new().format(&instr, &mut t);
-                        eprintln!("refused NoScratch at +{:#x}: {t}", instr.ip() - text.base);
-                    }
-                    *s.refused.entry(r).or_default() += 1
-                }
-                Ok(_) => {
-                    let rip = instr.ip();
-                    let strategy = if instr.len() >= JUMP {
-                        Strategy::Direct
-                    } else if text.island_near(rip + 2, &taken).is_some() {
-                        Strategy::Island
-                    } else {
-                        let span = Patcher::span(text, instr);
-                        let leaf = if text.relocation_proven(rip) {
-                            None
-                        } else {
-                            text.leaf_proven(rip)
-                        };
-                        let proven = text.relocation_proven(rip) || leaf.is_some();
-                        if span.is_ok() && proven {
-                            Strategy::Relocate
-                        } else {
-                            if Patcher::backward_span(text, instr)
-                                .or_else(|| {
-                                    leaf.and_then(|b| Patcher::backward_span_in(text, instr, b))
-                                })
-                                .is_some()
-                            {
-                                Strategy::BlockStart
-                            } else {
-                                let mut why = if proven {
-                                    // What stops the block-start jump.
-                                    if before.last().is_some_and(|b| {
-                                        b.flow_control() == FlowControl::Call
-                                            || b.flow_control() == FlowControl::IndirectCall
-                                    }) {
-                                        "store right after a call"
-                                    } else if text.is_target(rip) {
-                                        "store is a branch target"
-                                    } else {
-                                        "branch target or ret within 5 bytes"
-                                    }
-                                } else {
-                                    text.unproven_kind(rip)
-                                };
-                                if why == "no .pdata (leaf or assembly)"
-                                    && text.leaf_piece(rip).is_some()
-                                {
-                                    why = "no .pdata (a leaf beside an unread jump)";
-                                }
-                                *s.int3_why.entry(why).or_default() += 1;
-                                if matches!(
-                                    why,
-                                    "branch target or ret within 5 bytes"
-                                        | "store right after a call"
-                                        | "store is a branch target"
-                                        | "no .pdata (leaf or assembly)"
-                                        | "no .pdata (a leaf beside an unread jump)"
-                                ) {
-                                    // The store, what led to it and what follows.
-                                    let mut list = before.clone();
-                                    list.push(instr);
-                                    let mut next = instr.next_ip();
-                                    for _ in 0..3 {
-                                        let i = Patcher::decode(text, next);
-                                        if i.is_invalid() {
-                                            break;
-                                        }
-                                        next = i.next_ip();
-                                        list.push(i);
-                                    }
-                                    *s.shapes
-                                        .entry(why)
-                                        .or_default()
-                                        .entry(shape::render(&list, text, Some(rip)))
-                                        .or_default() += 1;
-                                }
-                                Strategy::Int3
-                            }
-                        }
-                    };
-                    *s.strategies.entry(strategy).or_default() += 1;
-                }
-            }
-        }
-    }
-    s
-}
-
-/// "function+offset" from the debug symbols, for diagnostics.
+/// "image+offset" of a code address, for diagnostics. (Not dbghelp: the
+/// title has no symbols, and VIctory's crash reports use dbghelp.)
 fn symbol(at: u64) -> String {
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        SYMBOL_INFO, SymFromAddr, SymInitialize, SymSetOptions,
-    };
-    static INIT: std::sync::Once = std::sync::Once::new();
-    // SAFETY: dbghelp on this process, once.
-    INIT.call_once(|| unsafe {
-        SymSetOptions(0x2 | 0x4);
-        let dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
-            .unwrap_or_default();
-        let dir = std::ffi::CString::new(dir).unwrap_or_default();
-        SymInitialize(GetCurrentProcess(), dir.as_ptr() as *const u8, 1);
-    });
-    #[repr(C)]
-    struct Buf {
-        info: SYMBOL_INFO,
-        name: [u8; 512],
-    }
-    // SAFETY: plain data, filled in by dbghelp.
-    let mut b: Buf = unsafe { std::mem::zeroed() };
-    b.info.SizeOfStruct = size_of::<SYMBOL_INFO>() as u32;
-    b.info.MaxNameLen = 512;
-    let mut displacement = 0u64;
-    // SAFETY: as above.
-    if unsafe { SymFromAddr(GetCurrentProcess(), at, &mut displacement, &mut b.info) } != 0 {
-        // SAFETY: a NUL-terminated name dbghelp wrote.
-        let name = unsafe { std::ffi::CStr::from_ptr(b.info.Name.as_ptr()) }.to_string_lossy();
-        format!("{name}+{displacement:#x}")
+    let mut module = std::ptr::null_mut();
+    // SAFETY: looks up the image holding `at`, without a reference.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as *const u16,
+            &mut module,
+        )
+    } != 0;
+    if found {
+        format!("image {:#x}+{:#x}", module as u64, at - module as u64)
     } else {
         format!("{at:#x}")
     }

@@ -66,52 +66,232 @@ pub fn on() -> bool {
     })
 }
 
-/// Starts barriers for the title's images (their bases): the scan of their
-/// code runs on a thread of its own, and patching begins when it is done.
-pub fn start(images: Vec<usize>) {
+/// A title image barriers patch.
+struct Image {
+    base: usize,
+    size: usize,
+    name: String,
+    /// Its PE header's time stamp: which build of it.
+    stamp: u32,
+    /// Scanned (or being scanned) already.
+    prepared: bool,
+}
+
+/// The title's images, in the order they came.
+static IMAGES: std::sync::Mutex<Vec<Image>> = std::sync::Mutex::new(Vec::new());
+/// Where the sites patched are remembered between runs.
+static SITES_FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// The time stamp and size of the image's headers.
+fn pe(base: usize) -> (u32, usize) {
+    // SAFETY: the headers of a mapped image: `e_lfanew`, then the file
+    // header's time stamp and the optional header's `SizeOfImage`.
+    unsafe {
+        let nt = base + ((base + 0x3c) as *const u32).read_unaligned() as usize;
+        let stamp = ((nt + 8) as *const u32).read_unaligned();
+        let size = ((nt + 0x50) as *const u32).read_unaligned() as usize;
+        (stamp, size)
+    }
+}
+
+fn register(base: usize, name: &str) {
+    let (stamp, size) = pe(base);
+    let mut images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if !images.iter().any(|i| i.base == base) {
+        images.push(Image {
+            base,
+            size,
+            name: name.to_ascii_lowercase(),
+            stamp,
+            prepared: false,
+        });
+    }
+}
+
+/// Starts barriers for the title's images (base, file name): the scan of
+/// their code runs on a thread of its own, and patching begins when it is
+/// done, first with the sites a run before patched (`sites`: the file they
+/// are remembered in; patched under one stop of the other threads).
+pub fn start(images: Vec<(usize, String)>, sites: Option<std::path::PathBuf>) {
     if !on() {
         return;
     }
-    let spawned = std::thread::Builder::new().name("barrier scan".into()).spawn(move || {
-        let began = std::time::Instant::now();
-        let Some(t) = tables::tables() else {
-            tracing::warn!("VICTORY_BARRIERS: no memory for the tables; barriers stay off");
-            return;
-        };
-        let relocate = std::env::var_os("VICTORY_BARRIER_RELOCATE").is_some_and(|v| v == "1");
-        let int3 = std::env::var_os("VICTORY_BARRIER_INT3").is_some_and(|v| v == "1");
-        let images: Vec<u64> = images.iter().map(|&b| b as u64).collect();
-        // SAFETY: the tables are statics of `victory_barrier`.
-        let patcher = match unsafe { Patcher::new(t, Config { relocate, int3, images: images.clone() }) } {
-            Ok(p) => &*Box::leak(Box::new(p)),
-            Err(e) => {
+    let _ = SITES_FILE.set(sites);
+    for (base, name) in &images {
+        register(*base, name);
+    }
+    let spawned = std::thread::Builder::new()
+        .name("barrier scan".into())
+        .spawn(move || {
+            let Some(t) = tables::tables() else {
+                tracing::warn!("VICTORY_BARRIERS: no memory for the tables; barriers stay off");
+                return;
+            };
+            let relocate = std::env::var_os("VICTORY_BARRIER_RELOCATE").is_some_and(|v| v == "1");
+            let int3 = std::env::var_os("VICTORY_BARRIER_INT3").is_some_and(|v| v == "1");
+            // SAFETY: the tables are statics of `victory_barrier`. (Images are
+            // added as each is scanned.)
+            let patcher = match unsafe {
+                Patcher::new(
+                    t,
+                    Config {
+                        relocate,
+                        int3,
+                        images: Vec::new(),
+                    },
+                )
+            } {
+                Ok(p) => &*Box::leak(Box::new(p)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "VICTORY_BARRIERS: barriers stay off");
+                    return;
+                }
+            };
+            if let Err(e) = victory_barrier::handler::install(patcher) {
                 tracing::warn!(error = %e, "VICTORY_BARRIERS: barriers stay off");
                 return;
             }
-        };
-        let targets: Vec<Option<usize>> = images.iter().map(|&base| patcher.prepare(base)).collect();
-        if let Err(e) = victory_barrier::handler::install(patcher) {
-            tracing::warn!(error = %e, "VICTORY_BARRIERS: barriers stay off");
-            return;
-        }
-        let _ = PATCHER.set(patcher);
-        tracing::info!(images = images.len(), ?targets, ms = began.elapsed().as_millis() as u64, "VICTORY_BARRIERS: the title's code scanned; stores that fault on guarded view memory are patched from now on");
-        say(patcher);
-    });
+            let _ = PATCHER.set(patcher);
+            prepare_pending(patcher);
+            say(patcher);
+        });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "VICTORY_BARRIERS: no thread for the scan; barriers stay off");
     }
 }
 
-/// What the barriers did, every ten seconds while it changes.
+/// The title mapped an image of its own after the start (`LoadLibrary`):
+/// it is scanned and patched too.
+pub fn image_loaded(base: usize, name: &str) {
+    if !on() {
+        return;
+    }
+    register(base, name);
+    if let Some(&patcher) = PATCHER.get() {
+        let _ = std::thread::Builder::new()
+            .name("barrier scan".into())
+            .spawn(move || prepare_pending(patcher));
+    }
+    // (Else the start's scan takes it.)
+}
+
+/// Scans the images not scanned yet, each then patched from the sites a run
+/// before remembered for it.
+fn prepare_pending(patcher: &'static Patcher) {
+    loop {
+        let next = {
+            let mut images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+            images.iter_mut().find(|i| !i.prepared).map(|i| {
+                i.prepared = true;
+                (i.base, i.name.clone(), i.stamp, i.size)
+            })
+        };
+        let Some((base, name, stamp, size)) = next else {
+            return;
+        };
+        let began = std::time::Instant::now();
+        // SAFETY: a title image, mapped for the rest of the run.
+        let targets = unsafe { patcher.prepare(base as u64) };
+        let scanned = began.elapsed();
+        let wanted = remembered(base, &name, stamp, size);
+        let patched = patcher.patch_many(&wanted);
+        tracing::info!(
+            image = %name,
+            targets = ?targets,
+            scan_ms = scanned.as_millis() as u64,
+            remembered = wanted.len(),
+            patched_ahead = patched,
+            ahead_ms = (began.elapsed() - scanned).as_millis() as u64,
+            "VICTORY_BARRIERS: scanned; its stores that fault on guarded view memory are patched from now on"
+        );
+    }
+}
+
+/// A line of the sites file: image name, its time stamp, the site's offset
+/// in it and a hash of its instruction, in hexadecimal. Offsets and hashes,
+/// no code of the title's.
+fn parse(line: &str) -> Option<(&str, u32, usize, u64)> {
+    let mut w = line.split_whitespace();
+    let name = w.next()?;
+    let stamp = u32::from_str_radix(w.next()?, 16).ok()?;
+    let rva = usize::from_str_radix(w.next()?, 16).ok()?;
+    let hash = u64::from_str_radix(w.next()?, 16).ok()?;
+    Some((name, stamp, rva, hash))
+}
+
+fn sites_text() -> String {
+    SITES_FILE
+        .get()
+        .cloned()
+        .flatten()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .unwrap_or_default()
+}
+
+/// The sites remembered for this build of the image whose instruction is
+/// still the one patched before: their addresses.
+fn remembered(base: usize, name: &str, stamp: u32, size: usize) -> Vec<u64> {
+    sites_text()
+        .lines()
+        .filter_map(parse)
+        .filter(|&(n, s, rva, _)| n == name && s == stamp && rva < size)
+        .filter_map(|(_, _, rva, hash)| {
+            let rip = (base + rva) as u64;
+            let len = victory_barrier::instruction_len(rip, (base + size) as u64)?;
+            (victory_barrier::instruction_hash(rip, len) == hash).then_some(rip)
+        })
+        .collect()
+}
+
+/// Writes the sites patched into the sites file, with what it held of
+/// images not seen in this run (other builds, DLLs not loaded yet).
+fn save(patcher: &Patcher) {
+    let Some(file) = SITES_FILE.get().cloned().flatten() else {
+        return;
+    };
+    let images: Vec<(usize, usize, String, u32)> = IMAGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|i| (i.base, i.size, i.name.clone(), i.stamp))
+        .collect();
+    let ours = |name: &str, stamp: u32| images.iter().any(|i| i.2 == name && i.3 == stamp);
+    let mut lines: std::collections::BTreeSet<String> = sites_text()
+        .lines()
+        .filter(|l| parse(l).is_some_and(|(n, s, _, _)| !ours(n, s)))
+        .map(String::from)
+        .collect();
+    for (rip, hash) in patcher.patched_sites() {
+        let rip = rip as usize;
+        if let Some((base, _, name, stamp)) = images.iter().find(|i| rip >= i.0 && rip < i.0 + i.1)
+        {
+            lines.insert(format!("{name} {stamp:08x} {:x} {hash:016x}", rip - base));
+        }
+    }
+    let text: String = lines.into_iter().map(|l| l + "\n").collect();
+    let partial = file.with_extension("txt.partial");
+    if std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, &file))
+        .is_err()
+    {
+        tracing::warn!(file = %file.display(), "VICTORY_BARRIERS: the sites patched could not be remembered");
+    }
+}
+
+/// What the barriers did, every ten seconds while it changes; and the sites
+/// patched, remembered for the next run.
 fn say(patcher: &'static Patcher) {
     let _ = std::thread::Builder::new()
         .name("barrier line".into())
         .spawn(move || {
-            let mut last = u64::MAX;
+            let (mut last, mut saved) = (u64::MAX, 0u64);
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 let s = patcher.stats();
+                if s.patched != saved {
+                    save(patcher);
+                    saved = s.patched;
+                }
                 let now = s.patched + s.breakpoints / 1024 + FAULTS.load(Ordering::Relaxed);
                 if now == last {
                     continue;
@@ -125,7 +305,7 @@ fn say(patcher: &'static Patcher) {
                     threads_moved = s.redirected_threads,
                     patching_ms = s.patch_ns / 1_000_000,
                     faults_seen = FAULTS.load(Ordering::Relaxed),
-                copy_pieces_beside = COPIED.load(Ordering::Relaxed),
+                    copy_pieces_beside = COPIED.load(Ordering::Relaxed),
                     blocks_beside = DELTAS.load(Ordering::Relaxed),
                     "barriers"
                 );
@@ -299,9 +479,15 @@ mod tests {
         let exe = unsafe {
             windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
         } as usize;
-        start(vec![exe]);
+        // The sites file, in a directory of the test's; the store's hash
+        // before it is patched.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sites.txt");
+        let store_at = victory_barrier_test_store as *const () as u64;
+        let hash = victory_barrier::instruction_hash(store_at, 6);
+        start(vec![(exe, "Test.exe".into())], Some(file.clone()));
         let began = std::time::Instant::now();
-        while PATCHER.get().is_none() {
+        while !PATCHER.get().is_some_and(|p| p.patches(exe as u64)) {
             assert!(began.elapsed().as_secs() < 120, "the scan never ended");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -402,6 +588,35 @@ mod tests {
             FAULTS.load(Ordering::Relaxed),
             2,
             "one more fault: the second view's block's first"
+        );
+        // Remembered for the next run: the image (by name and build), the
+        // store's offset in it, the hash of the instruction it was.
+        save(PATCHER.get().unwrap());
+        let text = std::fs::read_to_string(&file).unwrap();
+        let (stamp, _) = pe(exe);
+        let line = format!(
+            "test.exe {stamp:08x} {:x} {hash:016x}",
+            store_at as usize - exe
+        );
+        assert!(text.lines().any(|l| l == line), "{line:?} not in {text:?}");
+        assert_eq!(
+            parse(&line),
+            Some(("test.exe", stamp, store_at as usize - exe, hash))
+        );
+        // What the file says of an image with another build is kept.
+        std::fs::write(
+            &file,
+            format!(
+                "{text}other.dll 00000001 10 0000000000000002
+"
+            ),
+        )
+        .unwrap();
+        save(PATCHER.get().unwrap());
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("other.dll 00000001 10")
         );
     }
 }

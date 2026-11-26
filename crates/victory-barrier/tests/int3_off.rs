@@ -100,11 +100,16 @@ fn short_stores_are_left_to_the_guards() {
     assert!(tables::track(ours, LEN as u64));
     // SAFETY: this test's image.
     let exe = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
-    let config = Config { relocate: false, int3: false, images: vec![exe] };
+    let config = Config {
+        relocate: false,
+        int3: false,
+        images: vec![exe],
+    };
     // SAFETY: the tables live for the process.
-    let patcher: &'static Patcher =
-        Box::leak(Box::new(unsafe { Patcher::new(tables::tables().unwrap(), config) }.unwrap()));
-    assert!(patcher.prepare(exe).is_some());
+    let patcher: &'static Patcher = Box::leak(Box::new(
+        unsafe { Patcher::new(tables::tables().unwrap(), config) }.unwrap(),
+    ));
+    assert!(unsafe { patcher.prepare(exe) }.is_some());
     assert!(STATE.set((title, ours, patcher)).is_ok());
     // SAFETY: a handler that lives as long as the process.
     assert!(!unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) }.is_null());
@@ -119,8 +124,14 @@ fn short_stores_are_left_to_the_guards() {
         }
         // SAFETY: as above.
         unsafe {
-            assert_eq!(std::ptr::read_volatile((title + BLOCK + 0x100) as *const u32), round + 1);
-            assert_eq!(std::ptr::read_volatile((title + 2 * BLOCK) as *const u32), round + 2);
+            assert_eq!(
+                std::ptr::read_volatile((title + BLOCK + 0x100) as *const u32),
+                round + 1
+            );
+            assert_eq!(
+                std::ptr::read_volatile((title + 2 * BLOCK) as *const u32),
+                round + 2
+            );
         }
         // The short store's block was opened, once a round; the wide one's
         // never was.
@@ -128,6 +139,10 @@ fn short_stores_are_left_to_the_guards() {
     }
     let stats = patcher.stats();
     assert_eq!(stats.patched, 1, "{stats:?}");
-    assert_eq!(stats.refused_sites.get(&Refusal::Int3Off), Some(&1), "{stats:?}");
+    assert_eq!(
+        stats.refused_sites.get(&Refusal::Int3Off),
+        Some(&1),
+        "{stats:?}"
+    );
     assert_eq!(stats.breakpoints, 0);
 }

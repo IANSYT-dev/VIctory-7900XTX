@@ -14,8 +14,8 @@
 //! at whether a taking is under way.
 
 use crate::layout::{
-    BLOCK_SHIFT, BLOCK_SHR, BLOCKS_PER_SLOT, PARTS_PER_BLOCK, PARTS_PER_SLOT, COARSE_SHIFT, COARSES_PER_SLOT, MID_SHIFT, MIDS_PER_SLOT,
-    SLOT_SHIFT, SLOTS, Tables, index, slot,
+    BLOCK_SHIFT, BLOCK_SHR, BLOCKS_PER_SLOT, COARSE_SHIFT, COARSES_PER_SLOT, MID_SHIFT,
+    MIDS_PER_SLOT, PARTS_PER_BLOCK, PARTS_PER_SLOT, SLOT_SHIFT, SLOTS, Tables, index, slot,
 };
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -259,9 +259,14 @@ pub fn take(wrote: impl FnOnce(&[(u64, u16)])) {
                     if fb.load(Ordering::SeqCst) == 0 || fb.swap(0, Ordering::SeqCst) == 0 {
                         continue;
                     }
-                    let parts = &bytes(part, PARTS_PER_SLOT)[f * PARTS_PER_BLOCK..(f + 1) * PARTS_PER_BLOCK];
+                    let parts = &bytes(part, PARTS_PER_SLOT)
+                        [f * PARTS_PER_BLOCK..(f + 1) * PARTS_PER_BLOCK];
                     let mask = parts.iter().enumerate().fold(0u16, |m, (k, pb)| {
-                        if pb.load(Ordering::SeqCst) != 0 && pb.swap(0, Ordering::SeqCst) != 0 { m | 1 << k } else { m }
+                        if pb.load(Ordering::SeqCst) != 0 && pb.swap(0, Ordering::SeqCst) != 0 {
+                            m | 1 << k
+                        } else {
+                            m
+                        }
                     });
                     // (None: an earlier taking took them, and the bytes.)
                     if mask != 0 {
@@ -296,7 +301,11 @@ mod tests {
         take(|b| got.extend_from_slice(b));
         assert_eq!(
             got,
-            vec![(view, 1), (view + (3 << 16), 0b11_0001), (view + (5 << 16), 0b1_1100)]
+            vec![
+                (view, 1),
+                (view + (3 << 16), 0b11_0001),
+                (view + (5 << 16), 0b1_1100)
+            ]
         );
         let mut again = Vec::new();
         take(|b| again.extend_from_slice(b));
