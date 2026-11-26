@@ -212,6 +212,16 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // Write barriers (VICTORY_BARRIERS=1, off by default): the title's stores
+    // that fault on guarded view memory are patched to store beside the
+    // guard. The scan of its code starts now, on a thread of its own, after
+    // the patches above (it keeps clear of their jumps).
+    #[cfg(windows)]
+    if execute && victory_hle::barrier::on() {
+        let images: Vec<usize> = std::iter::once(image.base()).chain(dlls.iter().map(|(_, dll)| dll.base())).collect();
+        println!("write barriers: scanning {} title image(s)", images.len());
+        victory_hle::barrier::start(images);
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

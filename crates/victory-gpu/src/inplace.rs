@@ -637,6 +637,35 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
     None
 }
 
+/// The title's addresses of the 64 KiB pages our own views ([`beside`])
+/// hold at `ours` (each a page's address): every view of each page, for the
+/// barriers' marks (`crate::barrier::take`). A page no view shows any more is
+/// left out.
+pub(crate) fn views_of_beside(ours: &[u64]) -> Vec<usize> {
+    let v = views();
+    let bytes: std::collections::HashMap<usize, u64> = v.sections.iter().map(|s| (s.0, s.1)).collect();
+    let mut wholes: Vec<(usize, usize, usize)> = v
+        .whole
+        .iter()
+        .filter(|w| w.1 != 0)
+        .filter_map(|&(section, base)| Some((base, base + *bytes.get(&section)? as usize, section)))
+        .collect();
+    wholes.sort_unstable();
+    let mut shown = Vec::new();
+    for &at in ours {
+        let at = at as usize;
+        let Some(&(base, end, section)) = wholes.partition_point(|w| w.0 <= at).checked_sub(1).map(|i| &wholes[i]) else {
+            continue;
+        };
+        if at < end
+            && let Some(all) = v.pages.get(&(section, (at - base) as u64))
+        {
+            shown.extend_from_slice(all);
+        }
+    }
+    shown
+}
+
 /// Whether `[at, at + len)` is private memory, all committed and
 /// read-write: what [`From::Part`] takes. One question to Windows (it
 /// walks the page tables to the end of the pages that share the first

@@ -22,8 +22,11 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-barrier = { path = "crates/victory-barrier" }
 
 # External crates
+# x86 decoding and encoding for the write barriers (MIT).
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "op_code_info", "intel"] }
 anyhow = "1.0.104"
 thiserror = "2.0.21"
 clap = { version = "4.6.9", features = ["derive"] }

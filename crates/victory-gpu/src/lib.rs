@@ -18,6 +18,8 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+pub mod barrier;
+#[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;

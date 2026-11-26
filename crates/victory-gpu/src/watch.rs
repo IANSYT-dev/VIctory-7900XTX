@@ -1209,6 +1209,21 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     Beside::Done
 }
 
+/// What write barriers stored beside their guards ([`crate::barrier`]),
+/// told as [`put_beside`] tells its own: at every view of each page written,
+/// one bit set, then the other cleared. Called before anything looks at
+/// those bits; returns only once every mark taken is told.
+fn barrier_marks() {
+    crate::barrier::take(|views| {
+        for &view in views {
+            BESIDE.set(view / BLOCK);
+        }
+        for &view in views {
+            PUBLISHED.clear(view / BLOCK);
+        }
+    });
+}
+
 /// A faulting store of the title's leaves `block` as it is: whether it may be
 /// left out (until that has been so often, since the block was taken, that
 /// the faults cost more than opening it).
@@ -1361,6 +1376,7 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
 fn published(start: usize, end: usize) -> bool {
+    barrier_marks();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // (In this order: who puts something in beside a guard sets the one bit,
     // then clears the other, which an asking that is publishing the block may
@@ -1818,6 +1834,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    barrier_marks();
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -1988,6 +2005,12 @@ pub(crate) const MANY_VIEWS: usize = 64;
 
 /// Whether all the views of a guarded page are guarded together
 /// (`VICTORY_VIEW_GUARD`).
+/// Whether bytes can be put beside a guard and told at every view
+/// ([`put_beside`]'s conditions): what write barriers need too.
+pub(crate) fn beside_possible() -> bool {
+    light() && view_guard()
+}
+
 fn view_guard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
@@ -2658,6 +2681,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::barrier::forget(at, len);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2711,6 +2735,8 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    // The title's stores there go where it means again.
+    crate::barrier::forget(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2789,6 +2815,15 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        // A write barrier at the instruction (`VICTORY_BARRIERS=1`): it
+        // stores beside the guard from now on, this time too.
+        if ours.is_none()
+            && PROTECTED.any(block, block + 1)
+            // SAFETY: the context the system passes, to go on from.
+            && crate::barrier::on_fault(unsafe { &mut *context }, at)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if ours.is_none()
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.
